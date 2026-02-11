@@ -29,7 +29,7 @@ Content-Type: text/plain; charset=utf-8
 Server ayakta 💪
 
 Gelen istek sayısı: {request_count}
-Sunucu saati: {current_time}
+Sunucu saati: {current_time} #saat sonradan eklendi eklemeyi unutmustum
 """
     conn.sendall(response.encode())
     conn.close()
