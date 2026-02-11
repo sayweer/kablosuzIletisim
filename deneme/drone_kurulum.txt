@@ -7,4 +7,4 @@ chmod +x drone_stream.sh
 
 
 
-çalıştırma = ./drone_stream.sh 192.168.1.50 9000 1280 720 30 3000
+çalıştırma = ./drone_stream.sh 192.168.1.50 9000 1280 720 30 3000                      //parametrelerde sadece ip icin olan kismi pc nin ip sini girmek lazım digerleri gerekmedikce defauld degerler fena degil...
