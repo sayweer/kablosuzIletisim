@@ -1,0 +1,10 @@
+sudo apt update
+
+sudo apt install -y gstreamer1.0-tools gstreamer1.0-plugins-{base,good,bad,ugly} \
+                    gstreamer1.0-libav
+
+chmod +x drone_stream.sh
+
+
+
+çalıştırma = ./drone_stream.sh 192.168.1.50 9000 1280 720 30 3000

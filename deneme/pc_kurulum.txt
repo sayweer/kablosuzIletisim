@@ -1,0 +1,11 @@
+sudo apt update
+
+sudo apt install -y python3-pip python3-opencv \
+    gstreamer1.0-tools gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav
+
+pip3 install pymavlink
+
+
+calistirma = python3 graund_station.py
+
+ss -lunpt | grep -E '9000|14550' //kontrol//
