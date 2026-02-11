@@ -9,3 +9,33 @@ pip3 install pymavlink
 calistirma = python3 graund_station.py
 
 ss -lunpt | grep -E '9000|14550' //kontrol//
+
+
+sudo apt update
+sudo apt install -y \
+  python3 python3-pip python3-opencv python3-numpy \
+  gstreamer1.0-tools gstreamer1.0-libav \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+
+
+pip3 install --upgrade pip
+pip3 install pymavlink
+
+
+
+python3 - << 'PY'
+import cv2
+bi = cv2.getBuildInformation()
+print("OpenCV:", cv2.__version__)
+print("GStreamer YES?" , ("GStreamer: YES" in bi) or ("GStreamer:                   YES" in bi))
+PY
+
+
+
+/////TESTLER
+gst-inspect-1.0 srtsrc
+gst-inspect-1.0 tsdemux
+gst-inspect-1.0 h264parse
+gst-inspect-1.0 avdec_h264
+gst-inspect-1.0 appsink
