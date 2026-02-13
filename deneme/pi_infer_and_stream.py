@@ -9,9 +9,7 @@ import queue
 import subprocess
 from ultralytics import YOLO
 
-# =========================
 # RASPBERRY KONFIG
-# =========================
 CAM_DEVICE = "/dev/video0"
 WIDTH = 640
 HEIGHT = 480
@@ -22,9 +20,8 @@ PC_IP = "192.168.1.50"      # Ground station PC IP
 SRT_PORT = 9000
 META_PORT = 5005            # Metadata UDP port (PC tarafinda ayni olmali)
 
-# ---- MODEL ----
 # KENDI DOSYA YOLUNA GORE DEGISTIR
-MODEL_PATH = "/home/pi/models/seyit.pt"
+MODEL_PATH = "seyit.pt"
 
 # YOLO ayarlari
 IMGSZ = 640
@@ -168,24 +165,30 @@ def srt_stream_loop():
     OpenCV frame -> ffmpeg stdin -> SRT H264 stream
     """
     global running
-
+    
     ffmpeg_cmd = [
-        "ffmpeg",
-        "-re",
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{WIDTH}x{HEIGHT}",
-        "-r", str(FPS),
-        "-i", "-",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-b:v", "2000k",
-        "-pix_fmt", "yuv420p",
-        "-f", "mpegts",
-        f"srt://{PC_IP}:{SRT_PORT}?mode=caller&latency=100"
-    ]
+    "ffmpeg",
+    "-re",
+    "-f", "rawvideo",
+    "-pix_fmt", "bgr24",
+    "-s", f"{WIDTH}x{HEIGHT}",
+    "-r", str(FPS),
+    "-i", "-",
+    "-an",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-tune", "zerolatency",
+    "-g", "30",                         # <<< EKLE >>> keyframe araligi
+    "-keyint_min", "30",                # <<< EKLE >>>
+    "-x264-params", "repeat-headers=1", # <<< EKLE >>> SPS/PPS tekrar
+    "-b:v", "2000k",
+    "-maxrate", "2000k",                # <<< EKLE >>> bitrate stabil
+    "-bufsize", "4000k",                # <<< EKLE >>>
+    "-pix_fmt", "yuv420p",
+    "-f", "mpegts",
+    f"srt://{PC_IP}:{SRT_PORT}?mode=caller&latency=100"
+]
+
 
     print("[SRT] ffmpeg process baslatiliyor...")
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
