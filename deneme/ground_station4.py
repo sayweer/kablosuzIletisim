@@ -86,7 +86,7 @@ def wait_first_frame(cap, timeout_sec: float):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         if cap.isOpened():
-            ok, frame = cap.read()
+            ok, frame = cap.read()   #yolo model buraya eklenecek.
             if ok and frame is not None and frame.size > 0:
                 return frame
         time.sleep(0.01)

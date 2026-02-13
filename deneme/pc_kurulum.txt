@@ -39,3 +39,6 @@ gst-inspect-1.0 tsdemux
 gst-inspect-1.0 h264parse
 gst-inspect-1.0 avdec_h264
 gst-inspect-1.0 appsink
+
+
+pip install -U ultralytics
