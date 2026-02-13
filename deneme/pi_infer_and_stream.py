@@ -15,7 +15,7 @@ WIDTH = 640
 HEIGHT = 480
 FPS = 30
 
-# ---- KENDI AGINA GORE DEGISTIR ----
+# - KENDI AGINA GORE DEGISTIR -
 PC_IP = "192.168.1.50"      # Ground station PC IP
 SRT_PORT = 9000
 META_PORT = 5005            # Metadata UDP port (PC tarafinda ayni olmali)
@@ -32,9 +32,7 @@ INFER_EVERY_N = 2           # 1=her frame, 2=2 frame'de 1 infer
 # Stream olarak annotate gondermek ister misin?
 STREAM_ANNOTATED = True     # True -> kutulu goruntu gonderir, False -> ham goruntu gonderir
 
-# =========================
 # PAYLASILAN DURUM
-# =========================
 running = True
 latest_frame = None
 latest_annotated = None
@@ -42,9 +40,7 @@ latest_meta = {"ts": 0.0, "detections": [], "infer_ms": 0.0}
 
 frame_lock = threading.Lock()
 
-# =========================
 # THREADS
-# =========================
 def capture_loop():
     global latest_frame, running
 
@@ -165,7 +161,7 @@ def srt_stream_loop():
     OpenCV frame -> ffmpeg stdin -> SRT H264 stream
     """
     global running
-    
+
     ffmpeg_cmd = [
     "ffmpeg",
     "-re",
