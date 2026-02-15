@@ -8,10 +8,7 @@ import threading
 import subprocess
 import numpy as np
 from pymavlink import mavutil
-
-# =========================
 # KONFIG
-# =========================
 SRT_LISTEN_PORT = 9000
 SRT_LATENCY_MS = 100
 VIDEO_MODE = "raw_h264"
@@ -32,9 +29,7 @@ META_LISTEN_PORT = 5005
 # Metadata eskimesi (sn)
 META_STALE_SEC = 0.8
 
-# =========================
 # META PAYLASIMI
-# =========================
 meta_lock = threading.Lock()
 meta_state = {"ts_recv": 0.0, "payload": {"ts": 0.0, "infer_ms": 0.0, "detections": []}}
 

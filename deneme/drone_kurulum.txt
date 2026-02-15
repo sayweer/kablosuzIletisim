@@ -1,10 +1,6 @@
 sudo apt update
-
-sudo apt install -y gstreamer1.0-tools gstreamer1.0-plugins-{base,good,bad,ugly} \
-                    gstreamer1.0-libav
-
-chmod +x drone_stream.sh
-
-
-
-çalıştırma = ./drone_stream.sh 192.168.1.50 9000 1280 720 30 3000                      //parametrelerde sadece ip icin olan kismi pc nin ip sini girmek lazım digerleri gerekmedikce defauld degerler fena degil...
+sudo apt install -y python3-pip python3-opencv gstreamer1.0-tools \
+gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+gstreamer1.0-plugins-ugly gstreamer1.0-libav
+python3 -m pip install -U pip
+python3 -m pip install ultralytics pymavlink

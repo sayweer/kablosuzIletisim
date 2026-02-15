@@ -8,10 +8,7 @@ import threading
 import subprocess
 import numpy as np
 from pymavlink import mavutil
-
-# =========================
 # KONFIG
-# =========================
 SRT_LISTEN_PORT = 9000
 SRT_LATENCY_MS = 100
 VIDEO_MODE = "ts"
