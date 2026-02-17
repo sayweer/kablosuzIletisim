@@ -2,19 +2,28 @@
 # -*- coding: utf-8 -*-
 """
 Jetson Nano Sender (Python 3.6)
-- Kamera al (GStreamer)
-- TensorRT (engine) ile tespit
-- SRT ile MPEG-TS(H264) video gönder
-- UDP ile metadata (detection kutuları) gönder
+- Kamera al (GStreamer / fallback V4L2)
+- TensorRT engine ile tespit
+- SRT (MPEG-TS/H264) video gönder
+- UDP ile metadata gönder
 
-HEDEF:
-- Video HER ZAMAN aksın (inference olmasa bile)
-- Inference varsa meta dolsun, yoksa det=0
-- TRT output formatı farklıysa otomatik yakalasın
+Stabilite notları:
+1) build_camera_candidates tuple.format hatası yok (format sadece string'e uygulanıyor)
+2) TRT output decode:
+   - (1,7,8400) / (C,N) YOLO-like -> conf = obj * max(cls_scores)
+   - (N,6+) xyxy+conf+cls
+   - (N,C) ve (C,N) iki yönü de dener
+3) Inference çökse bile stream devam eder
+4) STREAM_ANNOTATED=True ise kutuları Jetson üstünde çizer
 """
 
 from __future__ import print_function
-import os, cv2, time, json, socket, threading
+import os
+import cv2
+import time
+import json
+import socket
+import threading
 import numpy as np
 
 # =========================
@@ -30,8 +39,8 @@ FPS = 30
 BITRATE_KBPS = 2500
 SRT_LATENCY_MS = 120
 
-# ÖNERİ: False (PC çizsin). True yaparsan Jetson kutulu video yollar.
-STREAM_ANNOTATED = False
+# Senin isteğin: kutuları Jetson çizsin
+STREAM_ANNOTATED = True
 
 USE_CSI_CAMERA = False
 CAM_DEVICE = "/dev/video0"
@@ -39,22 +48,34 @@ CAM_DEVICE = "/dev/video0"
 ENABLE_INFERENCE = True
 ENGINE_PATH = "quad_yolov11n.engine"
 IMGSZ = 640
-CONF_THRES = 0.35
+CONF_THRES = 0.25
 IOU_THRES = 0.45
-INFER_EVERY_N = 1
+INFER_EVERY_N = 1          # 2 veya 3 yaparsan Nano rahatlar
+DET_STALE_SEC = 0.35       # eski detections bu süreden sonra çizilmez
 
 # =========================
-# GLOBAL
+# GLOBALS
 # =========================
 running = True
-frame_lock = threading.Lock()
+state_lock = threading.Lock()
 
 latest_raw = None
-latest_tx  = None
-latest_meta = {"ts": 0.0, "infer_ms": 0.0, "detections": [], "seq": 0}
+latest_raw_seq = 0
+
+latest_dets = []
+latest_det_ts = 0.0
+latest_infer_ms = 0.0
+
+latest_meta = {
+    "ts": 0.0,
+    "seq": 0,
+    "infer_ms": 0.0,
+    "detections": [],
+    "trt_ok": False
+}
 
 # =========================
-# TRT import
+# TRT IMPORT
 # =========================
 HAS_TRT = False
 try:
@@ -62,7 +83,7 @@ try:
     import pycuda.driver as cuda
     HAS_TRT = True
 except Exception as e:
-    print("[TRT] TensorRT/PyCUDA yok:", e)
+    print("[TRT] TensorRT/PyCUDA import yok:", e)
     HAS_TRT = False
 
 
@@ -75,35 +96,35 @@ def opencv_has_gstreamer():
 
 
 # =========================
-# Kamera
+# CAMERA
 # =========================
 def build_camera_candidates():
     cands = []
     if USE_CSI_CAMERA:
-        cands.append((
-            "csi_nvargus",
+        pipe = (
             "nvarguscamerasrc ! "
             "video/x-raw(memory:NVMM),width={w},height={h},framerate={fps}/1,format=NV12 ! "
             "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
-        ).format(w=WIDTH, h=HEIGHT, fps=FPS))
+        ).format(w=WIDTH, h=HEIGHT, fps=FPS)
+        cands.append(("csi_nvargus", pipe))
     else:
-        cands.append((
-            "usb_mjpeg",
+        pipe1 = (
             "v4l2src device={dev} ! "
             "image/jpeg,width={w},height={h},framerate={fps}/1 ! "
             "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
-        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS))
+        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS)
+        cands.append(("usb_mjpeg", pipe1))
 
-        cands.append((
-            "usb_raw",
+        pipe2 = (
             "v4l2src device={dev} ! "
             "video/x-raw,width={w},height={h},framerate={fps}/1 ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
-        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS))
+        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS)
+        cands.append(("usb_raw", pipe2))
     return cands
 
 
@@ -112,20 +133,20 @@ def open_camera():
         print("[CAM] Deneniyor:", name)
         cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
         if cap.isOpened():
-            ok, frame = cap.read()
-            if ok and frame is not None and frame.size > 0:
+            ok, fr = cap.read()
+            if ok and fr is not None and fr.size > 0:
                 print("[CAM] Acildi:", name)
                 return cap, name
         cap.release()
 
-    print("[CAM] GStreamer kamera acilmadi, V4L2 fallback...")
+    print("[CAM] GStreamer acilmadi, V4L2 fallback...")
     cap = cv2.VideoCapture(CAM_DEVICE)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, FPS)
-        ok, frame = cap.read()
-        if ok and frame is not None and frame.size > 0:
+        ok, fr = cap.read()
+        if ok and fr is not None and fr.size > 0:
             print("[CAM] V4L2 fallback acildi.")
             return cap, "opencv_v4l2"
     cap.release()
@@ -133,10 +154,14 @@ def open_camera():
 
 
 # =========================
-# SRT Writer (NVENC FIX)
+# SRT WRITER (NVENC)
 # =========================
-def build_srt_writer_pipeline_nvv4l2():
-    uri = "srt://{}:{}?mode=caller&latency={}&transtype=live".format(PC_IP, SRT_PORT, SRT_LATENCY_MS)
+def build_srt_writer_pipeline():
+    uri = "srt://{}:{}?mode=caller&latency={}&transtype=live".format(
+        PC_IP, SRT_PORT, SRT_LATENCY_MS
+    )
+
+    # wait-for-connection=false -> PC yokken bile sender kilitlenmez
     pipe = (
         "appsrc is-live=true block=true do-timestamp=true format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 ! "
@@ -146,44 +171,52 @@ def build_srt_writer_pipeline_nvv4l2():
         "nvv4l2h264enc bitrate={br} insert-sps-pps=true iframeinterval=30 idrinterval=30 "
         "control-rate=1 preset-level=1 maxperf-enable=1 ! "
         "h264parse config-interval=1 ! mpegtsmux alignment=7 ! queue ! "
-        "srtsink uri=\"{uri}\" wait-for-connection=true sync=false async=false"
+        "srtsink uri=\"{uri}\" wait-for-connection=false sync=false async=false"
     ).format(w=WIDTH, h=HEIGHT, fps=FPS, br=BITRATE_KBPS * 1000, uri=uri)
+
     return pipe
 
 
 def open_writer():
-    pipe = build_srt_writer_pipeline_nvv4l2()
+    pipe = build_srt_writer_pipeline()
     print("[SRT] Writer pipeline:\n", pipe)
+
     wr = cv2.VideoWriter(pipe, cv2.CAP_GSTREAMER, 0, FPS, (WIDTH, HEIGHT), True)
     if wr.isOpened():
-        print("[SRT] Writer acildi: nvv4l2 (NVMM)")
-        return wr, "ts_nvv4l2_nvmm"
+        print("[SRT] Writer acildi (NVENC/NVMM)")
+        return wr
+
     try:
         wr.release()
     except Exception:
         pass
-    return None, None
+    return None
 
 
 # =========================
-# Utils: letterbox + NMS
+# HELPERS
 # =========================
-def letterbox_bgr(img, new_shape=640, color=(114,114,114)):
+def letterbox_bgr(img, new_shape=640, color=(114, 114, 114)):
     h, w = img.shape[:2]
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
 
     r = min(float(new_shape[0]) / float(h), float(new_shape[1]) / float(w))
     new_unpad = (int(round(w * r)), int(round(h * r)))
-    dw = (new_shape[1] - new_unpad[0]) / 2.0
-    dh = (new_shape[0] - new_unpad[1]) / 2.0
+
+    dw = float(new_shape[1] - new_unpad[0]) / 2.0
+    dh = float(new_shape[0] - new_unpad[1]) / 2.0
 
     resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
-    left = int(round(dw - 0.1)); right = int(round(dw + 0.1))
 
-    out = cv2.copyMakeBorder(resized, top, bottom, left, right,
-                             cv2.BORDER_CONSTANT, value=color)
+    top = int(round(dh - 0.1))
+    bottom = int(round(dh + 0.1))
+    left = int(round(dw - 0.1))
+    right = int(round(dw + 0.1))
+
+    out = cv2.copyMakeBorder(
+        resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
+    )
     return out, r, dw, dh
 
 
@@ -193,8 +226,11 @@ def nms_xyxy(boxes, scores, iou_thres):
     boxes = np.array(boxes, dtype=np.float32)
     scores = np.array(scores, dtype=np.float32)
 
-    x1 = boxes[:,0]; y1 = boxes[:,1]; x2 = boxes[:,2]; y2 = boxes[:,3]
-    areas = np.maximum(0.0, x2-x1) * np.maximum(0.0, y2-y1)
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
     order = scores.argsort()[::-1]
     keep = []
 
@@ -207,9 +243,9 @@ def nms_xyxy(boxes, scores, iou_thres):
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
 
-        w = np.maximum(0.0, xx2-xx1)
-        h = np.maximum(0.0, yy2-yy1)
-        inter = w*h
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
         union = areas[i] + areas[order[1:]] - inter + 1e-6
         iou = inter / union
 
@@ -218,20 +254,39 @@ def nms_xyxy(boxes, scores, iou_thres):
     return keep
 
 
+def clip_box(x1, y1, x2, y2, w, h):
+    x1 = max(0.0, min(float(w - 1), x1))
+    y1 = max(0.0, min(float(h - 1), y1))
+    x2 = max(0.0, min(float(w - 1), x2))
+    y2 = max(0.0, min(float(h - 1), y2))
+    return x1, y1, x2, y2
+
+
 def draw_dets(frame, dets):
     for d in dets:
-        x1 = int(d["x1"]); y1 = int(d["y1"])
-        x2 = int(d["x2"]); y2 = int(d["y2"])
-        cls = int(d["cls"]); conf = float(d["conf"])
-        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,200,255), 2)
-        cv2.putText(frame, "cls:{} {:.2f}".format(cls, conf),
-                    (x1, max(20, y1-8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,255), 1)
+        x1 = int(d["x1"])
+        y1 = int(d["y1"])
+        x2 = int(d["x2"])
+        y2 = int(d["y2"])
+        cls = int(d["cls"])
+        conf = float(d["conf"])
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+        txt = "cls:{} {:.2f}".format(cls, conf)
+        cv2.putText(
+            frame,
+            txt,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 200, 255),
+            1
+        )
     return frame
 
 
 # =========================
-# TRT Detector
+# TRT DETECTOR
 # =========================
 class TRTDetector(object):
     def __init__(self, engine_path):
@@ -250,7 +305,7 @@ class TRTDetector(object):
 
         self.context = self.engine.create_execution_context()
         if self.context is None:
-            raise RuntimeError("Context fail")
+            raise RuntimeError("Context create fail")
 
         self.input_idx = None
         for i in range(self.engine.num_bindings):
@@ -262,11 +317,12 @@ class TRTDetector(object):
 
         in_shape = tuple(self.context.get_binding_shape(self.input_idx))
         if -1 in in_shape:
-            self.context.set_binding_shape(self.input_idx, (1,3,IMGSZ,IMGSZ))
+            self.context.set_binding_shape(self.input_idx, (1, 3, IMGSZ, IMGSZ))
 
-        self.bindings = [None]*self.engine.num_bindings
-        self.host_in = []
-        self.dev_in = []
+        self.bindings = [None] * self.engine.num_bindings
+        self.host_in = None
+        self.dev_in = None
+
         self.host_out = []
         self.dev_out = []
         self.out_bind_idxs = []
@@ -276,19 +332,24 @@ class TRTDetector(object):
             shape = tuple(self.context.get_binding_shape(i))
             if -1 in shape:
                 shape = tuple([1 if d < 0 else int(d) for d in shape])
+
             size = int(np.prod(shape))
             host_mem = cuda.pagelocked_empty(size, dtype)
             dev_mem = cuda.mem_alloc(host_mem.nbytes)
             self.bindings[i] = int(dev_mem)
 
             if self.engine.binding_is_input(i):
-                self.host_in.append(host_mem); self.dev_in.append(dev_mem)
+                self.host_in = host_mem
+                self.dev_in = dev_mem
             else:
                 self.out_bind_idxs.append(i)
-                self.host_out.append(host_mem); self.dev_out.append(dev_mem)
+                self.host_out.append(host_mem)
+                self.dev_out.append(dev_mem)
 
         self.stream = cuda.Stream()
-        print("[TRT] Engine yüklendi:", engine_path)
+        self._shape_logged = False
+
+        print("[TRT] Engine yuklendi:", engine_path)
         for i in range(self.engine.num_bindings):
             print("[TRT] binding", i, self.engine.get_binding_name(i), self.context.get_binding_shape(i))
 
@@ -296,13 +357,13 @@ class TRTDetector(object):
         img, ratio, dw, dh = letterbox_bgr(bgr, IMGSZ)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         x = rgb.astype(np.float32) / 255.0
-        x = np.transpose(x, (2,0,1))
+        x = np.transpose(x, (2, 0, 1))
         x = np.expand_dims(x, 0)
         return x, ratio, dw, dh
 
     def infer_raw(self, x):
-        np.copyto(self.host_in[0], x.ravel())
-        cuda.memcpy_htod_async(self.dev_in[0], self.host_in[0], self.stream)
+        np.copyto(self.host_in, x.ravel())
+        cuda.memcpy_htod_async(self.dev_in, self.host_in, self.stream)
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
 
         for i in range(len(self.dev_out)):
@@ -318,208 +379,327 @@ class TRTDetector(object):
             outs.append(arr)
         return outs
 
-    def decode(self, outs, orig_w, orig_h, ratio, dw, dh):
-        if not outs:
+    def _decode_cn(self, out_cn, orig_w, orig_h, ratio, dw, dh):
+        # out_cn: (C, N)
+        C = int(out_cn.shape[0])
+        N = int(out_cn.shape[1])
+
+        if C < 6:
             return []
 
-        out = np.array(outs[0])
-        out = np.squeeze(out)
+        xywh = out_cn[0:4, :].astype(np.float32)
 
-        # Debug: ilk kez shape yazdır
-        # (sürekli spam olmasın diye küçük bir kontrol)
-        if not hasattr(self, "_shape_logged"):
-            print("[TRT] output shape:", out.shape)
-            self._shape_logged = True
+        # normalize mi pixel mi? kaba ama pratik:
+        # eğer max küçükse (<=2) normalize kabul edip IMGSZ ile çarp.
+        max_xywh = float(np.max(np.abs(xywh))) if xywh.size > 0 else 0.0
+        if max_xywh <= 2.0:
+            xywh = xywh * float(IMGSZ)
 
-        dets = []
+        obj = out_cn[4, :].astype(np.float32)
+
+        if C > 5:
+            cls_scores = out_cn[5:, :].astype(np.float32)
+            cls_ids = np.argmax(cls_scores, axis=0).astype(np.int32)
+            cls_best = np.max(cls_scores, axis=0).astype(np.float32)
+            conf = obj * cls_best
+        else:
+            cls_ids = np.zeros((N,), dtype=np.int32)
+            conf = obj
+
+        idxs = np.where(conf >= CONF_THRES)[0]
+        if idxs.size == 0:
+            return []
+
+        if idxs.size > 300:
+            top = np.argsort(conf[idxs])[::-1][:300]
+            idxs = idxs[top]
+
         boxes = []
         scores = []
         clses = []
 
-        # FORMAT A: (N,6)  -> x1,y1,x2,y2,conf,cls
-        if out.ndim == 2 and out.shape[1] >= 6:
-            for row in out:
-                conf = float(row[4])
-                if conf < CONF_THRES:
-                    continue
-                x1,y1,x2,y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-                cls = int(row[5])
+        for j in idxs:
+            cx = float(xywh[0, j])
+            cy = float(xywh[1, j])
+            w = float(xywh[2, j])
+            h = float(xywh[3, j])
 
-                x1 = (x1 - dw) / ratio; y1 = (y1 - dh) / ratio
-                x2 = (x2 - dw) / ratio; y2 = (y2 - dh) / ratio
+            x1 = cx - (w / 2.0)
+            y1 = cy - (h / 2.0)
+            x2 = cx + (w / 2.0)
+            y2 = cy + (h / 2.0)
 
-                x1 = max(0.0, min(float(orig_w-1), x1))
-                y1 = max(0.0, min(float(orig_h-1), y1))
-                x2 = max(0.0, min(float(orig_w-1), x2))
-                y2 = max(0.0, min(float(orig_h-1), y2))
+            # letterbox geri çözüm
+            x1 = (x1 - dw) / ratio
+            y1 = (y1 - dh) / ratio
+            x2 = (x2 - dw) / ratio
+            y2 = (y2 - dh) / ratio
 
-                boxes.append([x1,y1,x2,y2]); scores.append(conf); clses.append(cls)
+            x1, y1, x2, y2 = clip_box(x1, y1, x2, y2, orig_w, orig_h)
 
-        # FORMAT B: (C,N)  -> xywh + class scores
-        elif out.ndim == 2 and out.shape[0] >= 6 and out.shape[1] > 6:
-            xywh = out[0:4, :]
-            cls_scores = out[4:, :]
-            confs = np.max(cls_scores, axis=0)
-            cls_ids = np.argmax(cls_scores, axis=0)
-
-            idxs = np.where(confs >= CONF_THRES)[0]
-            if idxs.size > 300:
-                top = np.argsort(confs[idxs])[::-1][:300]
-                idxs = idxs[top]
-
-            for j in idxs:
-                conf = float(confs[j]); cls = int(cls_ids[j])
-                cx = float(xywh[0,j]); cy = float(xywh[1,j])
-                w = float(xywh[2,j]); h = float(xywh[3,j])
-
-                x1 = cx - w/2.0; y1 = cy - h/2.0
-                x2 = cx + w/2.0; y2 = cy + h/2.0
-
-                x1 = (x1 - dw) / ratio; y1 = (y1 - dh) / ratio
-                x2 = (x2 - dw) / ratio; y2 = (y2 - dh) / ratio
-
-                x1 = max(0.0, min(float(orig_w-1), x1))
-                y1 = max(0.0, min(float(orig_h-1), y1))
-                x2 = max(0.0, min(float(orig_w-1), x2))
-                y2 = max(0.0, min(float(orig_h-1), y2))
-
-                boxes.append([x1,y1,x2,y2]); scores.append(conf); clses.append(cls)
-
-        else:
-            print("[TRT][WARN] Output format tanınmadı:", out.shape)
-            return []
+            boxes.append([x1, y1, x2, y2])
+            scores.append(float(conf[j]))
+            clses.append(int(cls_ids[j]))
 
         keep = nms_xyxy(boxes, scores, IOU_THRES)
+
+        dets = []
         for i in keep:
-            x1,y1,x2,y2 = boxes[i]
+            b = boxes[i]
             dets.append({
                 "cls": int(clses[i]),
                 "conf": float(scores[i]),
-                "x1": float(x1), "y1": float(y1),
-                "x2": float(x2), "y2": float(y2)
+                "x1": float(b[0]),
+                "y1": float(b[1]),
+                "x2": float(b[2]),
+                "y2": float(b[3])
             })
         return dets
+
+    def _decode_n6(self, out_n6, orig_w, orig_h, ratio, dw, dh):
+        # out_n6: (N, 6+) -> x1,y1,x2,y2,conf,cls
+        arr = out_n6.astype(np.float32)
+        if arr.shape[1] < 6:
+            return []
+
+        # normalize mi?
+        max_xy = float(np.max(np.abs(arr[:, :4]))) if arr.shape[0] > 0 else 0.0
+        if max_xy <= 2.0:
+            arr[:, :4] *= float(IMGSZ)
+
+        boxes = []
+        scores = []
+        clses = []
+
+        for i in range(arr.shape[0]):
+            conf = float(arr[i, 4])
+            if conf < CONF_THRES:
+                continue
+
+            x1 = float(arr[i, 0]); y1 = float(arr[i, 1])
+            x2 = float(arr[i, 2]); y2 = float(arr[i, 3])
+            cls = int(arr[i, 5]) if arr.shape[1] > 5 else 0
+
+            x1 = (x1 - dw) / ratio
+            y1 = (y1 - dh) / ratio
+            x2 = (x2 - dw) / ratio
+            y2 = (y2 - dh) / ratio
+
+            x1, y1, x2, y2 = clip_box(x1, y1, x2, y2, orig_w, orig_h)
+
+            boxes.append([x1, y1, x2, y2])
+            scores.append(conf)
+            clses.append(cls)
+
+        keep = nms_xyxy(boxes, scores, IOU_THRES)
+
+        dets = []
+        for k in keep:
+            b = boxes[k]
+            dets.append({
+                "cls": int(clses[k]),
+                "conf": float(scores[k]),
+                "x1": float(b[0]),
+                "y1": float(b[1]),
+                "x2": float(b[2]),
+                "y2": float(b[3])
+            })
+        return dets
+
+    def decode_auto(self, out, orig_w, orig_h, ratio, dw, dh):
+        # out: squeezed tek output
+        # olasılar:
+        # (C,N) -> YOLO-like
+        # (N,C) -> YOLO-like veya N,6
+        # (N,6+) -> xyxy conf cls
+        if out.ndim != 2:
+            return []
+
+        r, c = int(out.shape[0]), int(out.shape[1])
+
+        # 1) (C,N) aday: C küçük, N büyük
+        if r <= 128 and c > r:
+            # C,N
+            if r >= 6:
+                dets = self._decode_cn(out, orig_w, orig_h, ratio, dw, dh)
+                if len(dets) > 0:
+                    return dets
+
+        # 2) (N,6+) aday
+        if c >= 6 and r > 0:
+            dets = self._decode_n6(out, orig_w, orig_h, ratio, dw, dh)
+            if len(dets) > 0:
+                return dets
+
+        # 3) transpose deneyelim
+        out_t = out.T
+        rt, ct = int(out_t.shape[0]), int(out_t.shape[1])
+
+        if rt <= 128 and ct > rt and rt >= 6:
+            dets = self._decode_cn(out_t, orig_w, orig_h, ratio, dw, dh)
+            if len(dets) > 0:
+                return dets
+
+        if ct >= 6 and rt > 0:
+            dets = self._decode_n6(out_t, orig_w, orig_h, ratio, dw, dh)
+            if len(dets) > 0:
+                return dets
+
+        return []
 
     def predict(self, bgr):
         h, w = bgr.shape[:2]
         x, ratio, dw, dh = self.preprocess(bgr)
         outs = self.infer_raw(x)
-        return self.decode(outs, w, h, ratio, dw, dh)
+        if not outs:
+            return []
+
+        out = np.squeeze(np.array(outs[0]))
+
+        if not self._shape_logged:
+            print("[TRT] output shape:", out.shape)
+            self._shape_logged = True
+
+        return self.decode_auto(out, w, h, ratio, dw, dh)
 
 
 # =========================
-# Threads
+# THREADS
 # =========================
 def capture_loop():
-    global latest_raw, latest_tx, latest_meta, running
+    global running, latest_raw, latest_raw_seq, latest_meta
     cap = None
-    seq = 0
 
     while running:
         if cap is None:
             cap, _ = open_camera()
             if cap is None:
-                print("[CAM] Kamera acilamadi, 2 sn sonra...")
+                print("[CAM] Kamera acilmadi, 2sn sonra...")
                 time.sleep(2.0)
                 continue
 
         ok, frame = cap.read()
         if not ok or frame is None:
-            print("[CAM] Frame yok, reset...")
+            print("[CAM] Frame yok, kamera reset...")
             try:
                 cap.release()
             except Exception:
                 pass
             cap = None
-            time.sleep(0.5)
+            time.sleep(0.4)
             continue
 
         if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
             frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
         frame = np.ascontiguousarray(frame)
-        seq += 1
 
-        # KRİTİK: inference olmasa bile video aksın diye
-        with frame_lock:
+        with state_lock:
             latest_raw = frame
-            if latest_tx is None:
-                latest_tx = frame
-            if latest_meta.get("seq", 0) == 0:
-                latest_meta = {"ts": time.time(), "infer_ms": 0.0, "detections": [], "seq": int(seq)}
+            latest_raw_seq += 1
+            if latest_meta["seq"] == 0:
+                latest_meta = {
+                    "ts": time.time(),
+                    "seq": int(latest_raw_seq),
+                    "infer_ms": 0.0,
+                    "detections": [],
+                    "trt_ok": False
+                }
 
     try:
-        if cap:
+        if cap is not None:
             cap.release()
     except Exception:
         pass
 
 
 def infer_loop():
-    global latest_tx, latest_meta, running
-    seq = 0
+    global running, latest_dets, latest_det_ts, latest_infer_ms, latest_meta
 
     infer_enabled = bool(ENABLE_INFERENCE and HAS_TRT)
+    trt_ok = False
     detector = None
     ctx = None
+
+    frame_counter = 0
 
     if infer_enabled:
         try:
             cuda.init()
             ctx = cuda.Device(0).make_context()
             detector = TRTDetector(ENGINE_PATH)
-            print("[TRT] Hazır.")
+            trt_ok = True
+            print("[TRT] Hazir.")
         except Exception as e:
-            print("[TRT] Açılamadı, inference kapandı:", e)
+            print("[TRT] Baslatilamadi, inference kapaniyor:", e)
             infer_enabled = False
+            trt_ok = False
             detector = None
             try:
-                if ctx: ctx.pop()
+                if ctx is not None:
+                    ctx.pop()
+                    ctx.detach()
             except Exception:
                 pass
             ctx = None
 
     while running:
-        with frame_lock:
+        with state_lock:
             frame = None if latest_raw is None else latest_raw.copy()
+            seq = int(latest_raw_seq)
 
         if frame is None:
             time.sleep(0.005)
             continue
 
-        seq += 1
+        frame_counter += 1
+        run_infer = infer_enabled and detector is not None and (frame_counter % INFER_EVERY_N == 0)
+
         dets = []
         infer_ms = 0.0
 
-        if infer_enabled and detector is not None and (seq % INFER_EVERY_N == 0):
+        if run_infer:
             t0 = time.time()
             try:
                 dets = detector.predict(frame)
             except Exception as e:
+                # Inference patlasa da sistem yaşamaya devam
                 print("[TRT] infer hata:", e)
                 dets = []
             infer_ms = (time.time() - t0) * 1000.0
 
-        # Video: ya ham gönder ya da kutulu gönder
-        tx = frame
-        if STREAM_ANNOTATED and dets:
-            tx = draw_dets(tx.copy(), dets)
+            with state_lock:
+                latest_dets = dets
+                latest_det_ts = time.time()
+                latest_infer_ms = float(infer_ms)
 
-        with frame_lock:
-            latest_tx = np.ascontiguousarray(tx)
-            latest_meta = {
-                "ts": time.time(),
-                "infer_ms": float(infer_ms),
-                "detections": dets,
-                "seq": int(seq)
-            }
+                latest_meta = {
+                    "ts": time.time(),
+                    "seq": int(seq),
+                    "infer_ms": float(infer_ms),
+                    "detections": dets,
+                    "trt_ok": bool(trt_ok)
+                }
+        else:
+            # Inference çalışmadığı frame'lerde de meta akışı sürsün
+            with state_lock:
+                latest_meta = {
+                    "ts": time.time(),
+                    "seq": int(seq),
+                    "infer_ms": float(latest_infer_ms),
+                    "detections": list(latest_dets),
+                    "trt_ok": bool(trt_ok)
+                }
 
         if not infer_enabled:
+            time.sleep(0.01)
+        else:
             time.sleep(0.001)
 
     try:
-        if ctx:
+        if ctx is not None:
             ctx.pop()
+            ctx.detach()
     except Exception:
         pass
 
@@ -527,24 +707,30 @@ def infer_loop():
 def stream_loop():
     global running
     wr = None
-    wr_name = "none"
     sent = 0
-    t_last = time.time()
+    t_log = time.time()
 
     while running:
         if wr is None:
-            wr, wr_name = open_writer()
+            wr = open_writer()
             if wr is None:
-                print("[SRT] Writer acilamadi, 2 sn sonra...")
+                print("[SRT] Writer acilamadi, 2sn sonra...")
                 time.sleep(2.0)
                 continue
 
-        with frame_lock:
-            frame = None if latest_tx is None else latest_tx.copy()
+        with state_lock:
+            frame = None if latest_raw is None else latest_raw.copy()
+            dets = list(latest_dets)
+            det_ts = float(latest_det_ts)
+            infer_ms = float(latest_infer_ms)
 
         if frame is None:
             time.sleep(0.01)
             continue
+
+        if STREAM_ANNOTATED:
+            if (time.time() - det_ts) <= DET_STALE_SEC and len(dets) > 0:
+                frame = draw_dets(frame, dets)
 
         frame = np.ascontiguousarray(frame)
 
@@ -552,25 +738,22 @@ def stream_loop():
             wr.write(frame)
             sent += 1
         except Exception as e:
-            print("[SRT] write hata, reset:", e)
+            print("[SRT] write hata, writer reset:", e)
             try:
                 wr.release()
             except Exception:
                 pass
             wr = None
-            time.sleep(0.5)
+            time.sleep(0.3)
             continue
 
         now = time.time()
-        if now - t_last >= 5.0:
-            with frame_lock:
-                det_cnt = len(latest_meta.get("detections", []))
-                infer_ms = float(latest_meta.get("infer_ms", 0.0))
-            print("[SRT] sent={} writer={} det={} infer_ms={:.1f}".format(sent, wr_name, det_cnt, infer_ms))
-            t_last = now
+        if now - t_log >= 5.0:
+            print("[SRT] sent={} det={} infer_ms={:.1f}".format(sent, len(dets), infer_ms))
+            t_log = now
 
     try:
-        if wr:
+        if wr is not None:
             wr.release()
     except Exception:
         pass
@@ -582,7 +765,7 @@ def meta_loop():
     print("[META] UDP -> {}:{}".format(PC_IP, META_PORT))
 
     while running:
-        with frame_lock:
+        with state_lock:
             payload = dict(latest_meta)
         try:
             sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
@@ -600,11 +783,11 @@ def main():
     global running
     print("[SYS] OpenCV:", cv2.__version__)
     print("[SYS] GStreamer:", opencv_has_gstreamer())
-    print("[SYS] TRT:", HAS_TRT, "ENABLE_INFERENCE:", ENABLE_INFERENCE)
+    print("[SYS] HAS_TRT:", HAS_TRT, "ENABLE_INFERENCE:", ENABLE_INFERENCE)
     print("[SYS] STREAM_ANNOTATED:", STREAM_ANNOTATED)
 
     if not opencv_has_gstreamer():
-        print("[ERR] OpenCV GStreamer yok.")
+        print("[ERR] OpenCV GStreamer yok. Bu haliyle calismaz.")
         return
 
     threads = [
@@ -613,6 +796,7 @@ def main():
         threading.Thread(target=stream_loop, daemon=True),
         threading.Thread(target=meta_loop, daemon=True),
     ]
+
     for t in threads:
         t.start()
 
@@ -624,6 +808,7 @@ def main():
         running = False
         time.sleep(1.0)
         print("[SYS] Bitti.")
+
 
 if __name__ == "__main__":
     main()
