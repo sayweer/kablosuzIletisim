@@ -7,14 +7,10 @@ Jetson Nano Sender (Python 3.6)
 - SRT (MPEG-TS/H264) video gönder
 - UDP ile metadata gönder
 
-Stabilite notları:
-1) build_camera_candidates tuple.format hatası yok (format sadece string'e uygulanıyor)
-2) TRT output decode:
-   - (1,7,8400) / (C,N) YOLO-like -> conf = obj * max(cls_scores)
-   - (N,6+) xyxy+conf+cls
-   - (N,C) ve (C,N) iki yönü de dener
-3) Inference çökse bile stream devam eder
-4) STREAM_ANNOTATED=True ise kutuları Jetson üstünde çizer
+Önemli düzeltmeler:
+1) (1,7,8400) için varsayılan decode: noobj (YOLOv8/11 tarzı 4+nc)
+2) Kutu kaybolması için stale ayarı genişletildi
+3) Inference çökse de stream devam eder
 """
 
 from __future__ import print_function
@@ -39,7 +35,7 @@ FPS = 30
 BITRATE_KBPS = 2500
 SRT_LATENCY_MS = 120
 
-# Senin isteğin: kutuları Jetson çizsin
+# Jetson üstünde çizip gönder
 STREAM_ANNOTATED = True
 
 USE_CSI_CAMERA = False
@@ -48,10 +44,21 @@ CAM_DEVICE = "/dev/video0"
 ENABLE_INFERENCE = True
 ENGINE_PATH = "quad_yolov11n.engine"
 IMGSZ = 640
-CONF_THRES = 0.25
+CONF_THRES = 0.20
 IOU_THRES = 0.45
-INFER_EVERY_N = 1          # 2 veya 3 yaparsan Nano rahatlar
-DET_STALE_SEC = 0.35       # eski detections bu süreden sonra çizilmez
+INFER_EVERY_N = 1
+
+# Senin çıktına göre kritik ayar:
+# noobj -> out = [x,y,w,h,cls1,cls2,...]
+# obj   -> out = [x,y,w,h,obj,cls1,cls2,...]
+# auto  -> iki yolu da dener, daha çok det çıkan yolu seçer
+DECODE_MODE = "noobj"   # "noobj" önerilen, istersen "auto"
+
+# Yavaş inferans varsa kutular yok gibi görünmesin
+DET_STALE_SEC = 2.0
+KEEP_LAST_DET_ALWAYS = True
+
+LOG_EVERY_SEC = 3.0
 
 # =========================
 # GLOBALS
@@ -65,12 +72,14 @@ latest_raw_seq = 0
 latest_dets = []
 latest_det_ts = 0.0
 latest_infer_ms = 0.0
+latest_trt_ok = False
 
 latest_meta = {
     "ts": 0.0,
     "seq": 0,
     "infer_ms": 0.0,
     "detections": [],
+    "det_count": 0,
     "trt_ok": False
 }
 
@@ -101,30 +110,30 @@ def opencv_has_gstreamer():
 def build_camera_candidates():
     cands = []
     if USE_CSI_CAMERA:
-        pipe = (
+        p = (
             "nvarguscamerasrc ! "
             "video/x-raw(memory:NVMM),width={w},height={h},framerate={fps}/1,format=NV12 ! "
             "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
         ).format(w=WIDTH, h=HEIGHT, fps=FPS)
-        cands.append(("csi_nvargus", pipe))
+        cands.append(("csi_nvargus", p))
     else:
-        pipe1 = (
+        p1 = (
             "v4l2src device={dev} ! "
             "image/jpeg,width={w},height={h},framerate={fps}/1 ! "
             "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
         ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS)
-        cands.append(("usb_mjpeg", pipe1))
+        cands.append(("usb_mjpeg", p1))
 
-        pipe2 = (
+        p2 = (
             "v4l2src device={dev} ! "
             "video/x-raw,width={w},height={h},framerate={fps}/1 ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
         ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS)
-        cands.append(("usb_raw", pipe2))
+        cands.append(("usb_raw", p2))
     return cands
 
 
@@ -137,7 +146,10 @@ def open_camera():
             if ok and fr is not None and fr.size > 0:
                 print("[CAM] Acildi:", name)
                 return cap, name
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
 
     print("[CAM] GStreamer acilmadi, V4L2 fallback...")
     cap = cv2.VideoCapture(CAM_DEVICE)
@@ -149,7 +161,11 @@ def open_camera():
         if ok and fr is not None and fr.size > 0:
             print("[CAM] V4L2 fallback acildi.")
             return cap, "opencv_v4l2"
-    cap.release()
+
+    try:
+        cap.release()
+    except Exception:
+        pass
     return None, None
 
 
@@ -160,9 +176,7 @@ def build_srt_writer_pipeline():
     uri = "srt://{}:{}?mode=caller&latency={}&transtype=live".format(
         PC_IP, SRT_PORT, SRT_LATENCY_MS
     )
-
-    # wait-for-connection=false -> PC yokken bile sender kilitlenmez
-    pipe = (
+    return (
         "appsrc is-live=true block=true do-timestamp=true format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 ! "
         "queue leaky=downstream max-size-buffers=2 ! "
@@ -174,18 +188,14 @@ def build_srt_writer_pipeline():
         "srtsink uri=\"{uri}\" wait-for-connection=false sync=false async=false"
     ).format(w=WIDTH, h=HEIGHT, fps=FPS, br=BITRATE_KBPS * 1000, uri=uri)
 
-    return pipe
-
 
 def open_writer():
     pipe = build_srt_writer_pipeline()
     print("[SRT] Writer pipeline:\n", pipe)
-
     wr = cv2.VideoWriter(pipe, cv2.CAP_GSTREAMER, 0, FPS, (WIDTH, HEIGHT), True)
     if wr.isOpened():
         print("[SRT] Writer acildi (NVENC/NVMM)")
         return wr
-
     try:
         wr.release()
     except Exception:
@@ -262,25 +272,20 @@ def clip_box(x1, y1, x2, y2, w, h):
     return x1, y1, x2, y2
 
 
-def draw_dets(frame, dets):
+def draw_dets(frame, dets, color=(0, 200, 255)):
     for d in dets:
-        x1 = int(d["x1"])
-        y1 = int(d["y1"])
-        x2 = int(d["x2"])
-        y2 = int(d["y2"])
-        cls = int(d["cls"])
-        conf = float(d["conf"])
+        x1 = int(d.get("x1", 0))
+        y1 = int(d.get("y1", 0))
+        x2 = int(d.get("x2", 0))
+        y2 = int(d.get("y2", 0))
+        cls = int(d.get("cls", 0))
+        conf = float(d.get("conf", 0.0))
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
-        txt = "cls:{} {:.2f}".format(cls, conf)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        txt = "c{} {:.2f}".format(cls, conf)
         cv2.putText(
-            frame,
-            txt,
-            (x1, max(20, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 200, 255),
-            1
+            frame, txt, (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1
         )
     return frame
 
@@ -348,6 +353,7 @@ class TRTDetector(object):
 
         self.stream = cuda.Stream()
         self._shape_logged = False
+        self._dbg_t = 0.0
 
         print("[TRT] Engine yuklendi:", engine_path)
         for i in range(self.engine.num_bindings):
@@ -379,32 +385,30 @@ class TRTDetector(object):
             outs.append(arr)
         return outs
 
-    def _decode_cn(self, out_cn, orig_w, orig_h, ratio, dw, dh):
-        # out_cn: (C, N)
+    def _decode_cn(self, out_cn, orig_w, orig_h, ratio, dw, dh, use_obj):
+        # out_cn: (C,N) -> xywh + scores
         C = int(out_cn.shape[0])
         N = int(out_cn.shape[1])
-
-        if C < 6:
+        if C < 6 or N < 1:
             return []
 
         xywh = out_cn[0:4, :].astype(np.float32)
 
-        # normalize mi pixel mi? kaba ama pratik:
-        # eğer max küçükse (<=2) normalize kabul edip IMGSZ ile çarp.
+        # normalize olabilir
         max_xywh = float(np.max(np.abs(xywh))) if xywh.size > 0 else 0.0
         if max_xywh <= 2.0:
             xywh = xywh * float(IMGSZ)
 
-        obj = out_cn[4, :].astype(np.float32)
+        score_mat = out_cn[4:, :].astype(np.float32)
 
-        if C > 5:
-            cls_scores = out_cn[5:, :].astype(np.float32)
+        if use_obj and score_mat.shape[0] >= 2:
+            obj = score_mat[0, :]
+            cls_scores = score_mat[1:, :]
             cls_ids = np.argmax(cls_scores, axis=0).astype(np.int32)
-            cls_best = np.max(cls_scores, axis=0).astype(np.float32)
-            conf = obj * cls_best
+            conf = (obj * np.max(cls_scores, axis=0)).astype(np.float32)
         else:
-            cls_ids = np.zeros((N,), dtype=np.int32)
-            conf = obj
+            cls_ids = np.argmax(score_mat, axis=0).astype(np.int32)
+            conf = np.max(score_mat, axis=0).astype(np.float32)
 
         idxs = np.where(conf >= CONF_THRES)[0]
         if idxs.size == 0:
@@ -419,17 +423,14 @@ class TRTDetector(object):
         clses = []
 
         for j in idxs:
-            cx = float(xywh[0, j])
-            cy = float(xywh[1, j])
-            w = float(xywh[2, j])
-            h = float(xywh[3, j])
+            cx = float(xywh[0, j]); cy = float(xywh[1, j])
+            w = float(xywh[2, j]); h = float(xywh[3, j])
 
-            x1 = cx - (w / 2.0)
-            y1 = cy - (h / 2.0)
-            x2 = cx + (w / 2.0)
-            y2 = cy + (h / 2.0)
+            x1 = cx - w / 2.0
+            y1 = cy - h / 2.0
+            x2 = cx + w / 2.0
+            y2 = cy + h / 2.0
 
-            # letterbox geri çözüm
             x1 = (x1 - dw) / ratio
             y1 = (y1 - dh) / ratio
             x2 = (x2 - dw) / ratio
@@ -449,20 +450,17 @@ class TRTDetector(object):
             dets.append({
                 "cls": int(clses[i]),
                 "conf": float(scores[i]),
-                "x1": float(b[0]),
-                "y1": float(b[1]),
-                "x2": float(b[2]),
-                "y2": float(b[3])
+                "x1": float(b[0]), "y1": float(b[1]),
+                "x2": float(b[2]), "y2": float(b[3])
             })
         return dets
 
     def _decode_n6(self, out_n6, orig_w, orig_h, ratio, dw, dh):
-        # out_n6: (N, 6+) -> x1,y1,x2,y2,conf,cls
+        # out_n6: (N,6+) -> x1,y1,x2,y2,conf,cls
         arr = out_n6.astype(np.float32)
         if arr.shape[1] < 6:
             return []
 
-        # normalize mi?
         max_xy = float(np.max(np.abs(arr[:, :4]))) if arr.shape[0] > 0 else 0.0
         if max_xy <= 2.0:
             arr[:, :4] *= float(IMGSZ)
@@ -499,53 +497,72 @@ class TRTDetector(object):
             dets.append({
                 "cls": int(clses[k]),
                 "conf": float(scores[k]),
-                "x1": float(b[0]),
-                "y1": float(b[1]),
-                "x2": float(b[2]),
-                "y2": float(b[3])
+                "x1": float(b[0]), "y1": float(b[1]),
+                "x2": float(b[2]), "y2": float(b[3])
             })
         return dets
 
     def decode_auto(self, out, orig_w, orig_h, ratio, dw, dh):
-        # out: squeezed tek output
-        # olasılar:
-        # (C,N) -> YOLO-like
-        # (N,C) -> YOLO-like veya N,6
-        # (N,6+) -> xyxy conf cls
+        if out.ndim == 3 and out.shape[0] == 1:
+            out = out[0]
+        out = np.squeeze(out)
+
+        if not self._shape_logged:
+            print("[TRT] output shape:", out.shape)
+            self._shape_logged = True
+
         if out.ndim != 2:
             return []
 
+        cands = []
+
+        def add_cand(name, dets):
+            if dets is None:
+                return
+            conf_sum = 0.0
+            for d in dets:
+                conf_sum += float(d.get("conf", 0.0))
+            cands.append((name, dets, len(dets), conf_sum))
+
         r, c = int(out.shape[0]), int(out.shape[1])
 
-        # 1) (C,N) aday: C küçük, N büyük
-        if r <= 128 and c > r:
-            # C,N
-            if r >= 6:
-                dets = self._decode_cn(out, orig_w, orig_h, ratio, dw, dh)
-                if len(dets) > 0:
-                    return dets
+        # (C,N)
+        if r >= 6 and c > r:
+            if DECODE_MODE in ("auto", "noobj"):
+                add_cand("cn_noobj", self._decode_cn(out, orig_w, orig_h, ratio, dw, dh, False))
+            if DECODE_MODE in ("auto", "obj"):
+                add_cand("cn_obj", self._decode_cn(out, orig_w, orig_h, ratio, dw, dh, True))
 
-        # 2) (N,6+) aday
-        if c >= 6 and r > 0:
-            dets = self._decode_n6(out, orig_w, orig_h, ratio, dw, dh)
-            if len(dets) > 0:
-                return dets
-
-        # 3) transpose deneyelim
+        # transpose (C,N) olabilir
         out_t = out.T
         rt, ct = int(out_t.shape[0]), int(out_t.shape[1])
+        if rt >= 6 and ct > rt:
+            if DECODE_MODE in ("auto", "noobj"):
+                add_cand("t_cn_noobj", self._decode_cn(out_t, orig_w, orig_h, ratio, dw, dh, False))
+            if DECODE_MODE in ("auto", "obj"):
+                add_cand("t_cn_obj", self._decode_cn(out_t, orig_w, orig_h, ratio, dw, dh, True))
 
-        if rt <= 128 and ct > rt and rt >= 6:
-            dets = self._decode_cn(out_t, orig_w, orig_h, ratio, dw, dh)
-            if len(dets) > 0:
-                return dets
+        # (N,6+)
+        if DECODE_MODE in ("auto", "n6"):
+            if c >= 6:
+                add_cand("n6", self._decode_n6(out, orig_w, orig_h, ratio, dw, dh))
+            if out_t.shape[1] >= 6:
+                add_cand("t_n6", self._decode_n6(out_t, orig_w, orig_h, ratio, dw, dh))
 
-        if ct >= 6 and rt > 0:
-            dets = self._decode_n6(out_t, orig_w, orig_h, ratio, dw, dh)
-            if len(dets) > 0:
-                return dets
+        if len(cands) == 0:
+            return []
 
-        return []
+        # en çok det, sonra toplam conf
+        cands.sort(key=lambda x: (x[2], x[3]), reverse=True)
+        best = cands[0]
+
+        now = time.time()
+        if now - self._dbg_t >= LOG_EVERY_SEC:
+            brief = ", ".join(["{}:{}".format(x[0], x[2]) for x in cands[:4]])
+            print("[TRTDBG] pick={} det={} | {}".format(best[0], best[2], brief))
+            self._dbg_t = now
+
+        return best[1]
 
     def predict(self, bgr):
         h, w = bgr.shape[:2]
@@ -553,28 +570,21 @@ class TRTDetector(object):
         outs = self.infer_raw(x)
         if not outs:
             return []
-
-        out = np.squeeze(np.array(outs[0]))
-
-        if not self._shape_logged:
-            print("[TRT] output shape:", out.shape)
-            self._shape_logged = True
-
-        return self.decode_auto(out, w, h, ratio, dw, dh)
+        return self.decode_auto(outs[0], w, h, ratio, dw, dh)
 
 
 # =========================
 # THREADS
 # =========================
 def capture_loop():
-    global running, latest_raw, latest_raw_seq, latest_meta
+    global running, latest_raw, latest_raw_seq
     cap = None
 
     while running:
         if cap is None:
             cap, _ = open_camera()
             if cap is None:
-                print("[CAM] Kamera acilmadi, 2sn sonra...")
+                print("[CAM] Kamera acilamadi, 2sn sonra...")
                 time.sleep(2.0)
                 continue
 
@@ -597,14 +607,6 @@ def capture_loop():
         with state_lock:
             latest_raw = frame
             latest_raw_seq += 1
-            if latest_meta["seq"] == 0:
-                latest_meta = {
-                    "ts": time.time(),
-                    "seq": int(latest_raw_seq),
-                    "infer_ms": 0.0,
-                    "detections": [],
-                    "trt_ok": False
-                }
 
     try:
         if cap is not None:
@@ -614,13 +616,11 @@ def capture_loop():
 
 
 def infer_loop():
-    global running, latest_dets, latest_det_ts, latest_infer_ms, latest_meta
+    global running, latest_dets, latest_det_ts, latest_infer_ms, latest_trt_ok, latest_meta
 
     infer_enabled = bool(ENABLE_INFERENCE and HAS_TRT)
-    trt_ok = False
     detector = None
     ctx = None
-
     frame_counter = 0
 
     if infer_enabled:
@@ -628,20 +628,13 @@ def infer_loop():
             cuda.init()
             ctx = cuda.Device(0).make_context()
             detector = TRTDetector(ENGINE_PATH)
-            trt_ok = True
+            latest_trt_ok = True
             print("[TRT] Hazir.")
         except Exception as e:
             print("[TRT] Baslatilamadi, inference kapaniyor:", e)
             infer_enabled = False
-            trt_ok = False
+            latest_trt_ok = False
             detector = None
-            try:
-                if ctx is not None:
-                    ctx.pop()
-                    ctx.detach()
-            except Exception:
-                pass
-            ctx = None
 
     while running:
         with state_lock:
@@ -655,15 +648,12 @@ def infer_loop():
         frame_counter += 1
         run_infer = infer_enabled and detector is not None and (frame_counter % INFER_EVERY_N == 0)
 
-        dets = []
-        infer_ms = 0.0
-
         if run_infer:
             t0 = time.time()
+            dets = []
             try:
                 dets = detector.predict(frame)
             except Exception as e:
-                # Inference patlasa da sistem yaşamaya devam
                 print("[TRT] infer hata:", e)
                 dets = []
             infer_ms = (time.time() - t0) * 1000.0
@@ -672,29 +662,27 @@ def infer_loop():
                 latest_dets = dets
                 latest_det_ts = time.time()
                 latest_infer_ms = float(infer_ms)
-
                 latest_meta = {
                     "ts": time.time(),
                     "seq": int(seq),
                     "infer_ms": float(infer_ms),
                     "detections": dets,
-                    "trt_ok": bool(trt_ok)
+                    "det_count": len(dets),
+                    "trt_ok": bool(latest_trt_ok)
                 }
         else:
-            # Inference çalışmadığı frame'lerde de meta akışı sürsün
+            # infer yokken de meta güncel kalsın
             with state_lock:
                 latest_meta = {
                     "ts": time.time(),
                     "seq": int(seq),
                     "infer_ms": float(latest_infer_ms),
                     "detections": list(latest_dets),
-                    "trt_ok": bool(trt_ok)
+                    "det_count": len(latest_dets),
+                    "trt_ok": bool(latest_trt_ok)
                 }
 
-        if not infer_enabled:
-            time.sleep(0.01)
-        else:
-            time.sleep(0.001)
+        time.sleep(0.001 if infer_enabled else 0.01)
 
     try:
         if ctx is not None:
@@ -728,8 +716,8 @@ def stream_loop():
             time.sleep(0.01)
             continue
 
-        if STREAM_ANNOTATED:
-            if (time.time() - det_ts) <= DET_STALE_SEC and len(dets) > 0:
+        if STREAM_ANNOTATED and len(dets) > 0:
+            if KEEP_LAST_DET_ALWAYS or ((time.time() - det_ts) <= DET_STALE_SEC):
                 frame = draw_dets(frame, dets)
 
         frame = np.ascontiguousarray(frame)
@@ -748,7 +736,7 @@ def stream_loop():
             continue
 
         now = time.time()
-        if now - t_log >= 5.0:
+        if now - t_log >= LOG_EVERY_SEC:
             print("[SRT] sent={} det={} infer_ms={:.1f}".format(sent, len(dets), infer_ms))
             t_log = now
 
@@ -784,7 +772,7 @@ def main():
     print("[SYS] OpenCV:", cv2.__version__)
     print("[SYS] GStreamer:", opencv_has_gstreamer())
     print("[SYS] HAS_TRT:", HAS_TRT, "ENABLE_INFERENCE:", ENABLE_INFERENCE)
-    print("[SYS] STREAM_ANNOTATED:", STREAM_ANNOTATED)
+    print("[SYS] STREAM_ANNOTATED:", STREAM_ANNOTATED, "DECODE_MODE:", DECODE_MODE)
 
     if not opencv_has_gstreamer():
         print("[ERR] OpenCV GStreamer yok. Bu haliyle calismaz.")
