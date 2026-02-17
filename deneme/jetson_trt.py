@@ -145,7 +145,7 @@ class TRTModel(object):
         self.bindings = [None] * self.num_bindings
         self.host_inputs = []
         self.cuda_inputs = []
-        self.host_outputs = []
+        self.ht_outputs = []
         self.cuda_outputs = []
         self.input_binding_idx = None
         self.output_binding_indices = []
