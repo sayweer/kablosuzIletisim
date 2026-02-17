@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Jetson Nano Sender (Python 3.6 uyumlu)
+Jetson Nano Sender (Python 3.6)
 - Kamera al (GStreamer)
-- TensorRT ile tespit (engine)
+- TensorRT (engine) ile tespit
 - SRT ile MPEG-TS(H264) video gönder
 - UDP ile metadata (detection kutuları) gönder
 
-NOT:
-- STREAM_ANNOTATED=True ise Jetson kutulu görüntüyü gönderir.
-- STREAM_ANNOTATED=False ise ham görüntü gönderir, kutuları PC çizer.
+HEDEF:
+- Video HER ZAMAN aksın (inference olmasa bile)
+- Inference varsa meta dolsun, yoksa det=0
+- TRT output formatı farklıysa otomatik yakalasın
 """
 
 from __future__ import print_function
@@ -29,7 +30,9 @@ FPS = 30
 BITRATE_KBPS = 2500
 SRT_LATENCY_MS = 120
 
-STREAM_ANNOTATED = False   # <- önerim: False (PC çizsin), istersen True yap
+# ÖNERİ: False (PC çizsin). True yaparsan Jetson kutulu video yollar.
+STREAM_ANNOTATED = False
+
 USE_CSI_CAMERA = False
 CAM_DEVICE = "/dev/video0"
 
@@ -38,13 +41,16 @@ ENGINE_PATH = "quad_yolov11n.engine"
 IMGSZ = 640
 CONF_THRES = 0.35
 IOU_THRES = 0.45
-INFER_EVERY_N = 1  # 2/3 yaparsan Jetson rahatlar
+INFER_EVERY_N = 1
 
+# =========================
+# GLOBAL
 # =========================
 running = True
 frame_lock = threading.Lock()
+
 latest_raw = None
-latest_tx = None
+latest_tx  = None
 latest_meta = {"ts": 0.0, "infer_ms": 0.0, "detections": [], "seq": 0}
 
 # =========================
@@ -59,12 +65,14 @@ except Exception as e:
     print("[TRT] TensorRT/PyCUDA yok:", e)
     HAS_TRT = False
 
+
 def opencv_has_gstreamer():
     try:
         bi = cv2.getBuildInformation()
         return ("GStreamer: YES" in bi) or ("GStreamer:                   YES" in bi)
     except Exception:
         return False
+
 
 # =========================
 # Kamera
@@ -98,6 +106,7 @@ def build_camera_candidates():
         ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS))
     return cands
 
+
 def open_camera():
     for name, pipe in build_camera_candidates():
         print("[CAM] Deneniyor:", name)
@@ -122,6 +131,7 @@ def open_camera():
     cap.release()
     return None, None
 
+
 # =========================
 # SRT Writer (NVENC FIX)
 # =========================
@@ -140,6 +150,7 @@ def build_srt_writer_pipeline_nvv4l2():
     ).format(w=WIDTH, h=HEIGHT, fps=FPS, br=BITRATE_KBPS * 1000, uri=uri)
     return pipe
 
+
 def open_writer():
     pipe = build_srt_writer_pipeline_nvv4l2()
     print("[SRT] Writer pipeline:\n", pipe)
@@ -147,8 +158,12 @@ def open_writer():
     if wr.isOpened():
         print("[SRT] Writer acildi: nvv4l2 (NVMM)")
         return wr, "ts_nvv4l2_nvmm"
-    wr.release()
+    try:
+        wr.release()
+    except Exception:
+        pass
     return None, None
+
 
 # =========================
 # Utils: letterbox + NMS
@@ -160,10 +175,8 @@ def letterbox_bgr(img, new_shape=640, color=(114,114,114)):
 
     r = min(float(new_shape[0]) / float(h), float(new_shape[1]) / float(w))
     new_unpad = (int(round(w * r)), int(round(h * r)))
-    dw = new_shape[1] - new_unpad[0]
-    dh = new_shape[0] - new_unpad[1]
-    dw /= 2.0
-    dh /= 2.0
+    dw = (new_shape[1] - new_unpad[0]) / 2.0
+    dh = (new_shape[0] - new_unpad[1]) / 2.0
 
     resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
     top = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
@@ -173,31 +186,37 @@ def letterbox_bgr(img, new_shape=640, color=(114,114,114)):
                              cv2.BORDER_CONSTANT, value=color)
     return out, r, dw, dh
 
+
 def nms_xyxy(boxes, scores, iou_thres):
     if len(boxes) == 0:
         return []
     boxes = np.array(boxes, dtype=np.float32)
     scores = np.array(scores, dtype=np.float32)
 
-    x1 = boxes[:, 0]; y1 = boxes[:, 1]; x2 = boxes[:, 2]; y2 = boxes[:, 3]
+    x1 = boxes[:,0]; y1 = boxes[:,1]; x2 = boxes[:,2]; y2 = boxes[:,3]
     areas = np.maximum(0.0, x2-x1) * np.maximum(0.0, y2-y1)
     order = scores.argsort()[::-1]
     keep = []
+
     while order.size > 0:
         i = int(order[0])
         keep.append(i)
+
         xx1 = np.maximum(x1[i], x1[order[1:]])
         yy1 = np.maximum(y1[i], y1[order[1:]])
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
+
         w = np.maximum(0.0, xx2-xx1)
         h = np.maximum(0.0, yy2-yy1)
         inter = w*h
         union = areas[i] + areas[order[1:]] - inter + 1e-6
         iou = inter / union
+
         inds = np.where(iou <= iou_thres)[0]
         order = order[inds + 1]
     return keep
+
 
 def draw_dets(frame, dets):
     for d in dets:
@@ -210,8 +229,9 @@ def draw_dets(frame, dets):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,255), 1)
     return frame
 
+
 # =========================
-# TRT Detector (YOLOv11 engine için basit decode)
+# TRT Detector
 # =========================
 class TRTDetector(object):
     def __init__(self, engine_path):
@@ -232,7 +252,6 @@ class TRTDetector(object):
         if self.context is None:
             raise RuntimeError("Context fail")
 
-        # input binding index
         self.input_idx = None
         for i in range(self.engine.num_bindings):
             if self.engine.binding_is_input(i):
@@ -241,28 +260,27 @@ class TRTDetector(object):
         if self.input_idx is None:
             raise RuntimeError("Input binding yok")
 
-        # dynamic ise set
         in_shape = tuple(self.context.get_binding_shape(self.input_idx))
         if -1 in in_shape:
             self.context.set_binding_shape(self.input_idx, (1,3,IMGSZ,IMGSZ))
 
-        # alloc
         self.bindings = [None]*self.engine.num_bindings
         self.host_in = []
-        self.dev_in  = []
+        self.dev_in = []
         self.host_out = []
-        self.dev_out  = []
+        self.dev_out = []
         self.out_bind_idxs = []
 
         for i in range(self.engine.num_bindings):
             dtype = trt.nptype(self.engine.get_binding_dtype(i))
             shape = tuple(self.context.get_binding_shape(i))
             if -1 in shape:
-                shape = tuple([1 if d<0 else int(d) for d in shape])
+                shape = tuple([1 if d < 0 else int(d) for d in shape])
             size = int(np.prod(shape))
             host_mem = cuda.pagelocked_empty(size, dtype)
             dev_mem = cuda.mem_alloc(host_mem.nbytes)
             self.bindings[i] = int(dev_mem)
+
             if self.engine.binding_is_input(i):
                 self.host_in.append(host_mem); self.dev_in.append(dev_mem)
             else:
@@ -271,11 +289,13 @@ class TRTDetector(object):
 
         self.stream = cuda.Stream()
         print("[TRT] Engine yüklendi:", engine_path)
+        for i in range(self.engine.num_bindings):
+            print("[TRT] binding", i, self.engine.get_binding_name(i), self.context.get_binding_shape(i))
 
     def preprocess(self, bgr):
         img, ratio, dw, dh = letterbox_bgr(bgr, IMGSZ)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        x = rgb.astype(np.float32)/255.0
+        x = rgb.astype(np.float32) / 255.0
         x = np.transpose(x, (2,0,1))
         x = np.expand_dims(x, 0)
         return x, ratio, dw, dh
@@ -284,6 +304,7 @@ class TRTDetector(object):
         np.copyto(self.host_in[0], x.ravel())
         cuda.memcpy_htod_async(self.dev_in[0], self.host_in[0], self.stream)
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+
         for i in range(len(self.dev_out)):
             cuda.memcpy_dtoh_async(self.host_out[i], self.dev_out[i], self.stream)
         self.stream.synchronize()
@@ -292,25 +313,50 @@ class TRTDetector(object):
         for out_i, bind_i in enumerate(self.out_bind_idxs):
             shape = tuple(self.context.get_binding_shape(bind_i))
             if -1 in shape:
-                shape = tuple([1 if d<0 else int(d) for d in shape])
+                shape = tuple([1 if d < 0 else int(d) for d in shape])
             arr = np.array(self.host_out[out_i]).reshape(shape)
             outs.append(arr)
         return outs
 
-    def decode_yolo(self, outs, orig_w, orig_h, ratio, dw, dh):
-        # Bu decode, sizin engine output'unuza bağlı.
-        # Çoğu YOLO TensorRT export: (1, 84, 8400) gibi gelir.
+    def decode(self, outs, orig_w, orig_h, ratio, dw, dh):
         if not outs:
             return []
-        out = np.squeeze(np.array(outs[0]))
+
+        out = np.array(outs[0])
+        out = np.squeeze(out)
+
+        # Debug: ilk kez shape yazdır
+        # (sürekli spam olmasın diye küçük bir kontrol)
+        if not hasattr(self, "_shape_logged"):
+            print("[TRT] output shape:", out.shape)
+            self._shape_logged = True
 
         dets = []
         boxes = []
         scores = []
         clses = []
 
-        if out.ndim == 2 and out.shape[0] >= 6 and out.shape[1] > 6:
-            # [C,N] varsayımı, first4=xywh, rest=class scores
+        # FORMAT A: (N,6)  -> x1,y1,x2,y2,conf,cls
+        if out.ndim == 2 and out.shape[1] >= 6:
+            for row in out:
+                conf = float(row[4])
+                if conf < CONF_THRES:
+                    continue
+                x1,y1,x2,y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                cls = int(row[5])
+
+                x1 = (x1 - dw) / ratio; y1 = (y1 - dh) / ratio
+                x2 = (x2 - dw) / ratio; y2 = (y2 - dh) / ratio
+
+                x1 = max(0.0, min(float(orig_w-1), x1))
+                y1 = max(0.0, min(float(orig_h-1), y1))
+                x2 = max(0.0, min(float(orig_w-1), x2))
+                y2 = max(0.0, min(float(orig_h-1), y2))
+
+                boxes.append([x1,y1,x2,y2]); scores.append(conf); clses.append(cls)
+
+        # FORMAT B: (C,N)  -> xywh + class scores
+        elif out.ndim == 2 and out.shape[0] >= 6 and out.shape[1] > 6:
             xywh = out[0:4, :]
             cls_scores = out[4:, :]
             confs = np.max(cls_scores, axis=0)
@@ -324,12 +370,13 @@ class TRTDetector(object):
             for j in idxs:
                 conf = float(confs[j]); cls = int(cls_ids[j])
                 cx = float(xywh[0,j]); cy = float(xywh[1,j])
-                w  = float(xywh[2,j]); h  = float(xywh[3,j])
+                w = float(xywh[2,j]); h = float(xywh[3,j])
+
                 x1 = cx - w/2.0; y1 = cy - h/2.0
                 x2 = cx + w/2.0; y2 = cy + h/2.0
 
-                x1 = (x1 - dw)/ratio; y1 = (y1 - dh)/ratio
-                x2 = (x2 - dw)/ratio; y2 = (y2 - dh)/ratio
+                x1 = (x1 - dw) / ratio; y1 = (y1 - dh) / ratio
+                x2 = (x2 - dw) / ratio; y2 = (y2 - dh) / ratio
 
                 x1 = max(0.0, min(float(orig_w-1), x1))
                 y1 = max(0.0, min(float(orig_h-1), y1))
@@ -339,7 +386,7 @@ class TRTDetector(object):
                 boxes.append([x1,y1,x2,y2]); scores.append(conf); clses.append(cls)
 
         else:
-            print("[TRT][WARN] Output shape desteklenmiyor:", out.shape)
+            print("[TRT][WARN] Output format tanınmadı:", out.shape)
             return []
 
         keep = nms_xyxy(boxes, scores, IOU_THRES)
@@ -357,14 +404,17 @@ class TRTDetector(object):
         h, w = bgr.shape[:2]
         x, ratio, dw, dh = self.preprocess(bgr)
         outs = self.infer_raw(x)
-        return self.decode_yolo(outs, w, h, ratio, dw, dh)
+        return self.decode(outs, w, h, ratio, dw, dh)
+
 
 # =========================
 # Threads
 # =========================
 def capture_loop():
-    global latest_raw, running
+    global latest_raw, latest_tx, latest_meta, running
     cap = None
+    seq = 0
+
     while running:
         if cap is None:
             cap, _ = open_camera()
@@ -376,7 +426,10 @@ def capture_loop():
         ok, frame = cap.read()
         if not ok or frame is None:
             print("[CAM] Frame yok, reset...")
-            cap.release()
+            try:
+                cap.release()
+            except Exception:
+                pass
             cap = None
             time.sleep(0.5)
             continue
@@ -384,12 +437,23 @@ def capture_loop():
         if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
             frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
+        frame = np.ascontiguousarray(frame)
+        seq += 1
+
+        # KRİTİK: inference olmasa bile video aksın diye
         with frame_lock:
-            latest_raw = np.ascontiguousarray(frame)
+            latest_raw = frame
+            if latest_tx is None:
+                latest_tx = frame
+            if latest_meta.get("seq", 0) == 0:
+                latest_meta = {"ts": time.time(), "infer_ms": 0.0, "detections": [], "seq": int(seq)}
+
     try:
-        if cap: cap.release()
+        if cap:
+            cap.release()
     except Exception:
         pass
+
 
 def infer_loop():
     global latest_tx, latest_meta, running
@@ -436,6 +500,7 @@ def infer_loop():
                 dets = []
             infer_ms = (time.time() - t0) * 1000.0
 
+        # Video: ya ham gönder ya da kutulu gönder
         tx = frame
         if STREAM_ANNOTATED and dets:
             tx = draw_dets(tx.copy(), dets)
@@ -453,9 +518,11 @@ def infer_loop():
             time.sleep(0.001)
 
     try:
-        if ctx: ctx.pop()
+        if ctx:
+            ctx.pop()
     except Exception:
         pass
+
 
 def stream_loop():
     global running
@@ -498,18 +565,22 @@ def stream_loop():
         if now - t_last >= 5.0:
             with frame_lock:
                 det_cnt = len(latest_meta.get("detections", []))
-            print("[SRT] sent={} writer={} det={}".format(sent, wr_name, det_cnt))
+                infer_ms = float(latest_meta.get("infer_ms", 0.0))
+            print("[SRT] sent={} writer={} det={} infer_ms={:.1f}".format(sent, wr_name, det_cnt, infer_ms))
             t_last = now
 
     try:
-        if wr: wr.release()
+        if wr:
+            wr.release()
     except Exception:
         pass
+
 
 def meta_loop():
     global running
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print("[META] UDP -> {}:{}".format(PC_IP, META_PORT))
+
     while running:
         with frame_lock:
             payload = dict(latest_meta)
@@ -518,16 +589,20 @@ def meta_loop():
         except Exception:
             pass
         time.sleep(0.03)
+
     try:
         sock.close()
     except Exception:
         pass
+
 
 def main():
     global running
     print("[SYS] OpenCV:", cv2.__version__)
     print("[SYS] GStreamer:", opencv_has_gstreamer())
     print("[SYS] TRT:", HAS_TRT, "ENABLE_INFERENCE:", ENABLE_INFERENCE)
+    print("[SYS] STREAM_ANNOTATED:", STREAM_ANNOTATED)
+
     if not opencv_has_gstreamer():
         print("[ERR] OpenCV GStreamer yok.")
         return
