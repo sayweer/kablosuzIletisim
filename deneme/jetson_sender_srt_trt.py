@@ -397,35 +397,33 @@ class TRTDetector(object):
 def build_camera_candidates():
     cands = []
     if USE_CSI_CAMERA:
-        # CSI Kamera (Jetson)
-        cands.append((
-            "csi_nvargus",
+        pipe = (
             "nvarguscamerasrc ! "
             "video/x-raw(memory:NVMM),width={w},height={h},framerate={fps}/1,format=NV12 ! "
             "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
-        ).format(w=WIDTH, h=HEIGHT, fps=FPS))
+        ).format(w=WIDTH, h=HEIGHT, fps=FPS)
+        cands.append(("csi_nvargus", pipe))
     else:
-        # USB MJPEG
-        cands.append((
-            "usb_mjpeg",
+        pipe1 = (
             "v4l2src device={dev} ! "
             "image/jpeg,width={w},height={h},framerate={fps}/1 ! "
             "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
-        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS))
+        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS)
+        cands.append(("usb_mjpeg", pipe1))
 
-        # USB RAW (MJPEG degilse bu tutar)
-        cands.append((
-            "usb_raw",
+        pipe2 = (
             "v4l2src device={dev} ! "
             "video/x-raw,width={w},height={h},framerate={fps}/1 ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
-        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS))
+        ).format(dev=CAM_DEVICE, w=WIDTH, h=HEIGHT, fps=FPS)
+        cands.append(("usb_raw", pipe2))
 
     return cands
+
 
 
 def open_camera():
@@ -534,35 +532,34 @@ def open_writer():
 
 def capture_loop():
     global latest_raw, running
-
-    cap = None
-    cam_name = None
-
-    while running:
-        if cap is None:
-            cap, cam_name = open_camera()
+    try:
+        cap = None
+        while running:
             if cap is None:
-                print("[CAM] Kamera acilamadi, 2 sn sonra tekrar...")
-                time.sleep(2.0)
+                cap, _ = open_camera()
+                if cap is None:
+                    print("[CAM] Kamera acilamadi, 2 sn sonra tekrar...")
+                    time.sleep(2.0)
+                    continue
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print("[CAM] Frame alinamadi, kamera yeniden aciliyor...")
+                cap.release()
+                cap = None
+                time.sleep(0.5)
                 continue
 
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            print("[CAM] Frame alinamadi, kamera yeniden aciliyor...")
-            cap.release()
-            cap = None
-            time.sleep(0.5)
-            continue
+            if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
+                frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
-        if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
-            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+            with frame_lock:
+                latest_raw = frame
 
-        with frame_lock:
-            latest_raw = frame
+    except Exception as e:
+        print("[CAM][FATAL] capture_loop crash:", e)
+        running = False
 
-    if cap:
-        cap.release()
-    print("[CAM] Thread kapandi.")
 
 
 def infer_loop():
