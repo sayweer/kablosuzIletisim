@@ -34,7 +34,7 @@ WIDTH = 640  # Kamera/stream hedef genişlik
 HEIGHT = 480  # Kamera/stream hedef yükseklik
 FPS = 30  # Hedef FPS  !!!!!!!!!  (yük artar, ısı artar)
 BITRATE_KBPS = 2500  # H264 bitrate (kbps), kalite/iş yükü dengesi
-SRT_LATENCY_MS = 120  # SRT’nin ek gecikme buffer’ı (ms) (daha düşük = daha az gecikme, daha çok drop riski)
+SRT_LATENCY_MS = 100  # SRT’nin ek gecikme buffer’ı (ms) (daha düşük = daha az gecikme, daha çok drop riski)
 
 # Jetson üstünde çizip gönder
 STREAM_ANNOTATED = True  # Kutuları Jetson’da çiz -> CPU yükü artar !!!!!!!!! (ısı + gecikme)
