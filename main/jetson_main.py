@@ -295,7 +295,7 @@ def inference_thread():
             
             with infer_lock:
                 if latest_infer_frame is not None:
-                    frame = latest_infer_frame.copy()
+                    frame = latest_infer_frame #copy fonksiyonu sildim cunku artik gerek yok threadlardaki goruntuler karismasin diye baslangicta kopya olusturdum.
                     frame_ts = latest_frame_ts
                     frame_seq = latest_frame_seq  # [YENİ] Barkod numarasını aldık
                     
