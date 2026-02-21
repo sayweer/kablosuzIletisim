@@ -48,8 +48,8 @@ def build_receiver_pipeline_nvidia(): #SRT üzerinden gelen videoyu ekran kartı
     appsink = "appsink drop=true max-buffers=1 sync=false" #appsink = OpenCV'nin videoyu GStreamer'dan teslim aldığı son nokta. drop=true (bilgisayar kasarsa eski kareleri çöpe at), max-buffers=1 (sadece en son gelen 1 kareyi RAM'de tut), sync=false (Videonun zaman damgasını bekleme, gelir gelmez ekrana bas).
     
     return (# pipeline birleştirme kısmı
-        "srtsrc uri=\"{uri}\" ! queue ! "  #SRT URI'sini dinle. queue: İşlemci yorulursa veriyi silmek yerine GStreamer'ın iç tamponunda beklet.
-        "h264parse ! nvh264dec ! "      #h264parse: Gelen düz byte akışını anlamlı H264 bloklarına (NAL units) ayırır. # nvh264dec: NVIDIA ekran kartının özel şifre çözücüsü. İşlemciyi (CPU) kullanmadan donanımsal olarak H264'ü çözer.
+        "srtsrc uri=\"{uri}\" ! queue max-size-buffers=4 leaky=downstream ! "  #SRT URI'sini dinle. queue: İşlemci yorulursa veriyi silmek yerine GStreamer'ın iç tamponunda beklet.
+        "tsdemux ! h264parse ! nvh264dec ! "      #h264parse: Gelen düz byte akışını anlamlı H264 bloklarına (NAL units) ayırır. # nvh264dec: NVIDIA ekran kartının özel şifre çözücüsü. İşlemciyi (CPU) kullanmadan donanımsal olarak H264'ü çözer.
         "videoconvert ! video/x-raw,format=BGR ! " # videoconvert: Ekran kartından çıkan ham formatı, OpenCV'nin sevdiği Mavi-Yeşil-Kırmızı (BGR) formatına çevirir.
         "{appsink}" # En son appsink değişkenini ekler.
     ).format(uri=uri, appsink=appsink)
@@ -89,7 +89,7 @@ def get_synced_metadata_by_seq(target_seq): #Okuduğumuz barkod numarasını (Ö
             return None
         
         # Kuyruktaki tüm verileri dön, barkod numarası eşleşeni bul!
-        for ts, payload in eta_queue:
+        for ts, payload in meta_queue:
             if payload.get("seq") == target_seq:
                 best_payload = payload
                 break  # Bulduğumuz an döngüden çık
@@ -112,14 +112,14 @@ def draw_dets(frame, dets): #Gelen JSON içindeki "detections" (hedefler) listes
         cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1) #yeşil dolgunun üzerine, siyah renkte (0,0,0), 1 kalınlığında yazımızı yazar.
     return frame
 
-class MetaReceiver(threading.Thread):
-    def __init__(self, ip, port):
-        threading.Thread.__init__(self, daemon=True)
-        self.ip = ip; self.port = port
-        self.stop_event = threading.Event()
+class MetaReceiver(threading.Thread): #Arka planda hiç durmadan çalışan, sadece UDP 5005 portunu dinleyen iş parçacığı (Thread).
+    def __init__(self, ip, port):#Sınıf ilk çağrıldığında çalışır.
+        threading.Thread.__init__(self, daemon=True) #daemon=True: Ana program (main) kapanırsa bu thread de arkada zombi gibi kalmasın, o da ölsün demektir
+        self.ip = ip; self.port = port #IP ve Port ayarlarını alır.
+        self.stop_event = threading.Event() #Thread'i dışarıdan güvenli bir şekilde kapatabilmek için konulan bayrak.
         self.sock = None
 
-    def stop(self):
+    def stop(self): #Sistemi kapatırken bayrağı kaldırır ve açık olan ağ soketini (kapıyı) kapatır.
         self.stop_event.set()
         if self.sock: self.sock.close()
 

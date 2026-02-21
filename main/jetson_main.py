@@ -265,71 +265,170 @@ def stream_thread():
 # THREAD 3: AI VE METADATA
 # =========================
 def inference_thread():
-    global latest_infer_frame, latest_frame_ts, running
-    
-    # [DÜZELTME]: PyCUDA'yı BURADA, kendi Thread'i içinde başlatıyoruz! Çökmeleri engeller.
-    cuda.init()
-    ctx = cuda.Device(0).make_context()
-    
-    yolo = None
-    try:
-        yolo = YOLO_TRT(ENGINE_PATH)
-        print("[AI] YOLO aktif.")
-    except Exception as e:
-        print("[ERR] AI Baslatilamadi:", e)
-            
+    global latest_infer_frame, latest_frame_ts, latest_frame_seq, running
+
+    # UDP soketi (her koşulda lazım)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # [DÜZELTME]: UDP soketinin veri tamponunu artırdık (Paket kaybını önlemek için)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-    
-    frame_count = 0
-    
-    # [DÜZELTME]: Yanıp sönen kutuları engellemek için son tespitleri hafızada tutuyoruz (Cache).
+
+    # Basit rate-limit (çok agresif spamlemesin)
+    SEND_MIN_INTERVAL_SEC = 0.01  # ~100 Hz üst sınır, pratikte daha düşük olur
+    last_send_t = 0.0
+
+    # Flicker engellemek için cache
     last_known_detections = []
     last_infer_ms = 0.0
-    
+
+    # Aynı kareyi tekrar tekrar infer etmemek için
+    last_infer_seq = None
+    frame_count = 0
+
+    # TRT yoksa: asla çökme, sadece boş metadata gönder.
+    if not HAS_TRT:
+        print("[AI] TensorRT/PyCUDA yok. Bos metadata ile devam (trt_ok=False).")
+        while running:
+            with infer_lock:
+                frame_ts = latest_frame_ts
+                frame_seq = latest_frame_seq
+
+            payload = {
+                "ts": frame_ts,
+                "seq": frame_seq,
+                "infer_ms": 0.0,
+                "detections": [],
+                "det_count": 0,
+                "trt_ok": False
+            }
+
+            now = time.time()
+            if now - last_send_t >= SEND_MIN_INTERVAL_SEC:
+                try:
+                    sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
+                except:
+                    pass
+                last_send_t = now
+
+            time.sleep(0.02)
+        return
+
+    # TRT var: CUDA context'i bu thread içinde kur
+    ctx = None
+    yolo = None
+    trt_ok = False
+
     try:
+        try:
+            cuda.init()
+            ctx = cuda.Device(0).make_context()
+        except Exception as e:
+            # CUDA context kurulamazsa bile thread ölmesin, boş metadata yollasın
+            print("[ERR] CUDA context kurulamadi:", e)
+            while running:
+                with infer_lock:
+                    frame_ts = latest_frame_ts
+                    frame_seq = latest_frame_seq
+
+                payload = {
+                    "ts": frame_ts,
+                    "seq": frame_seq,
+                    "infer_ms": 0.0,
+                    "detections": [],
+                    "det_count": 0,
+                    "trt_ok": False
+                }
+
+                now = time.time()
+                if now - last_send_t >= SEND_MIN_INTERVAL_SEC:
+                    try:
+                        sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
+                    except:
+                        pass
+                    last_send_t = now
+
+                time.sleep(0.02)
+            return
+
+        # Engine yükle
+        try:
+            yolo = YOLO_TRT(ENGINE_PATH)
+            trt_ok = True
+            print("[AI] YOLO TensorRT aktif.")
+        except Exception as e:
+            print("[ERR] YOLO engine acilamadi (bos dets ile devam):", e)
+            yolo = None
+            trt_ok = False
+
         while running:
             frame = None
             frame_ts = 0.0
-            
+            frame_seq = 0
+
+            # En güncel inference karesini al
             with infer_lock:
                 if latest_infer_frame is not None:
-                    frame = latest_infer_frame #copy fonksiyonu sildim cunku artik gerek yok threadlardaki goruntuler karismasin diye baslangicta kopya olusturdum.
+                    frame = latest_infer_frame
                     frame_ts = latest_frame_ts
-                    frame_seq = latest_frame_seq  # [YENİ] Barkod numarasını aldık
-                    
+                    frame_seq = latest_frame_seq
+
             if frame is None:
                 time.sleep(0.01)
                 continue
-                
-            if yolo and (frame_count % INFER_EVERY_N == 0):
+
+            # Aynı seq'i infer etmeye çalışma (CPU/GPU boş yere yorulmasın)
+            # Ama metadata'yı yine de göndereceğiz (cache ile)
+            do_infer = False
+            if yolo is not None:
+                # INFER_EVERY_N ile birlikte çalışsın
+                if (frame_count % INFER_EVERY_N) == 0:
+                    # Aynı seq geldiyse tekrar infer etme
+                    if last_infer_seq != frame_seq:
+                        do_infer = True
+
+            if do_infer:
                 t0 = time.time()
                 try:
                     last_known_detections = yolo.infer(frame)
-                except Exception: pass
-                last_infer_ms = (time.time() - t0) * 1000
+                    last_infer_ms = (time.time() - t0) * 1000.0
+                    last_infer_seq = frame_seq
+                except Exception:
+                    # Hata olursa son iyi dets kalsın, infer_ms güncellenmesin
+                    pass
 
             frame_count += 1
-            
-            # [DÜZELTME]: AI o karede çalışmamış olsa bile, hafızadaki son kutuları (last_known_detections) yolluyoruz.
+
+            # Metadata payload (her durumda gönder)
             payload = {
                 "ts": frame_ts,
-                "seq": frame_seq,  # <--- İşte Yerdeki PC'nin arayacağı TC Kimlik Numarası!
-                "infer_ms": last_infer_ms,
+                "seq": frame_seq,
+                "infer_ms": float(last_infer_ms),
                 "detections": last_known_detections,
                 "det_count": len(last_known_detections),
-                "trt_ok": True if yolo else False
+                "trt_ok": True if (trt_ok and yolo is not None) else False
             }
-            
-            try: sock.sendto(json.dumps(payload).encode('utf-8'), (PC_IP, META_PORT))
-            except: pass
-            
-            time.sleep(0.01)
-            
+
+            now = time.time()
+            if now - last_send_t >= SEND_MIN_INTERVAL_SEC:
+                try:
+                    sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
+                except:
+                    pass
+                last_send_t = now
+
+            # Ufak nefes
+            time.sleep(0.005)
+
     finally:
-        # Program kapanırken ekran kartı hafızasını temizler.
-        ctx.pop()
+        # CUDA context temizliği (Jetson'da önemli)
+        try:
+            if ctx is not None:
+                ctx.pop()
+                # ctx.detach() bazı sistemlerde daha temiz kapatır
+                try:
+                    ctx.detach()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 # =========================
 # MAIN
