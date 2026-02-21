@@ -1,64 +1,70 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 ###255'ten 0'a dönerken yaşanabilecek saliselik bir atlama ihtimali için bulanık eşleştirme algoritması hazırlayacağız sonraki prototiplerde!!!!!)
+
+
+#os = işletim sistemiyle konuşmak için(dosya yolları falan filan)
+#cv2 = openCV ,görüntü okuma ,çizim yapma ,ekrana basma
+#time = FPS hesaplamak için
+#json = ağdan gelen metni pythonun anlayacağı dile çevirmek için.
+#socket = UDP ve Mavlink gibi ağ bağlantı yollarını açmak için.
+#threading = işleri asenkron yapabilmek için 
 import os, cv2, time, json, socket, threading
-import numpy as np #numpy nin mean fonksiyonunu 8x8 piksel meselesinde kullandık
-from pymavlink import mavutil
-from collections import deque # Bufferlama için gerekli
+import numpy as np #matris ve matematik kütüphanesi. np adıyla kısaltıyoruz. numpy nin mean fonksiyonunu 8x8 piksel meselesinde kullandık
+from pymavlink import mavutil #dronun beyniyle (pixhawk/ardupilot) standart havacılık dili yani MAVlinkle konuşmak için.
+from collections import deque # Bufferlama için gerekli /çift yönlü kuyruk. baştan ve sondan veri atılabilir.
 
-# --- AYARLAR ---
-SRT_LISTEN_PORT = 9000
-SRT_LATENCY_MS = 120         # Wi-Fi ortamında biraz artırmak titremeyi azaltır
+# --- ağ AYARLARI ---
+SRT_LISTEN_PORT = 9000 #SRT protokolünün yer istasyonundaki kapı numarası. 9000 standartmış.
+SRT_LATENCY_MS = 120  # SRT nin paket kaybına karşı ne kadar süre bekleyeceğidir. Wi-Fi ortamında biraz artırmak titremeyi azaltır
 
-MAVLINK_CONN_STR = "udp:0.0.0.0:14550"
-MAVLINK_BAUD = 57600
-MAVLINK_SOURCE_SYS = 255
+MAVLINK_CONN_STR = "udp:0.0.0.0:14550" # demek "Bana gelen tüm ağ kartlarını dinle" demektir. 14550 standart UDP MAVLink portudur.
+MAVLINK_BAUD = 57600 #Bağlantı hızı... UDP üzerinden çok önemli olmasa da standart Ardupilot hızı 57600 olarak girilir.
+MAVLINK_SOURCE_SYS = 255 #yer istasyonunun mavlinkdeki kimlik numarası
 MAVLINK_SOURCE_COMP = 190
 
-META_LISTEN_IP = "0.0.0.0"
-META_LISTEN_PORT = 5005
-META_BUFFER_LEN = 50         # Geçmiş metadataları tutacak kuyruk uzunluğu
+META_LISTEN_IP = "0.0.0.0" #UDP üzerinden gelen JSON (Kutu) verilerini tüm IP adreslerinden dinlemek için 0.0.0.0
+META_LISTEN_PORT = 5005  #görüntü işleme verisinin ineceği kapı. Videodan bağımsız olması için 5005 seçildi.
+META_BUFFER_LEN = 120    # Geçmiş metadataları tutacak kuyruk uzunluğu
 
-SHOW_WINDOW = True
-WINDOW_NAME = "Ground Station - NVIDIA Accelerated"
+SHOW_WINDOW = True #Görüntüyü ekrana basıp basmayacağımızı belirten anahtar.
+WINDOW_NAME = "Ground Station - NVIDIA Accelerated"  #Açılacak OpenCV penceresinin sol üstünde yazacak başlık.
 
 # --- GLOBAL DEĞIŞKENLER ---
-meta_lock = threading.Lock()
-# Gelen ham metadayı bir kuyrukta tutuyoruz.
+meta_lock = threading.Lock() #Thread kilidi. UDP dinleyicisi listeye veri yazarken, ana kod oradan okumaya kalkışıp çökmesin diye konulan polis.
+
 # Yapı: [(ts_recv, payload), (ts_recv, payload), ...]
-meta_queue = deque(maxlen=META_BUFFER_LEN) 
+meta_queue = deque(maxlen=META_BUFFER_LEN) # Gelen ham metadataları tutan kuyruk. deque yapısı sayesinde maxlen=50'yi geçince 51. veri gelirse en eski olan 1. veriyi kendiliğinden siler.
 
-def opencv_has_gstreamer():
+def opencv_has_gstreamer(): #Bilgisayarına kurduğun OpenCV kütüphanesinin GStreamer (donanım hızlandırma) desteğiyle derlenip derlenmediğini kontrol eden fonksiyon.
     try:
-        bi = cv2.getBuildInformation()
-        return ("GStreamer: YES" in bi) or ("GStreamer:                   YES" in bi)
+        bi = cv2.getBuildInformation() #OpenCV'nin nasıl kurulduğunun devasa bir metin raporunu verir.
+        return ("GStreamer: YES" in bi) or ("GStreamer:                   YES" in bi) #Bu raporun içinde "GStreamer: YES" kelimesi geçiyorsa True (Var) döner, yoksa False döner.
     except Exception:
-        return False
+        return False #kodun herhangi bir yerinde hata çıkarsa default olarak GStreamer yokmuş gibi davranacak.
 
-def build_receiver_pipeline_nvidia():
-    uri = "srt://:{}?mode=listener&latency={}&transtype=live".format(SRT_LISTEN_PORT, SRT_LATENCY_MS)
-    appsink = "appsink drop=true max-buffers=1 sync=false"
+def build_receiver_pipeline_nvidia(): #SRT üzerinden gelen videoyu ekran kartı (GPU) ile çözecek GStreamer boru hattını string (metin) olarak oluşturur. ekran kartı olmayan bilgisayarda denersek büyük sıkıntı
+    uri = "srt://:{}?mode=listener&latency={}&transtype=live".format(SRT_LISTEN_PORT, SRT_LATENCY_MS) # uri: SRT dinleyici adresi. mode=listener (PC bağlantıyı bekler). latency=120ms. transtype=live (canlı yayın profili, gecikmeyi düşük tutar).
+    appsink = "appsink drop=true max-buffers=1 sync=false" #appsink = OpenCV'nin videoyu GStreamer'dan teslim aldığı son nokta. drop=true (bilgisayar kasarsa eski kareleri çöpe at), max-buffers=1 (sadece en son gelen 1 kareyi RAM'de tut), sync=false (Videonun zaman damgasını bekleme, gelir gelmez ekrana bas).
     
-    # [DÜZELTME]: PC için standart donanım hızlandırıcı (nvh264dec) ve standart dönüştürücü (videoconvert)
-    return (
-        "srtsrc uri=\"{uri}\" ! queue ! "
-        "h264parse ! nvh264dec ! "             
-        "videoconvert ! video/x-raw,format=BGR ! " 
-        "{appsink}"
+    return (# pipeline birleştirme kısmı
+        "srtsrc uri=\"{uri}\" ! queue ! "  #SRT URI'sini dinle. queue: İşlemci yorulursa veriyi silmek yerine GStreamer'ın iç tamponunda beklet.
+        "h264parse ! nvh264dec ! "      #h264parse: Gelen düz byte akışını anlamlı H264 bloklarına (NAL units) ayırır. # nvh264dec: NVIDIA ekran kartının özel şifre çözücüsü. İşlemciyi (CPU) kullanmadan donanımsal olarak H264'ü çözer.
+        "videoconvert ! video/x-raw,format=BGR ! " # videoconvert: Ekran kartından çıkan ham formatı, OpenCV'nin sevdiği Mavi-Yeşil-Kırmızı (BGR) formatına çevirir.
+        "{appsink}" # En son appsink değişkenini ekler.
     ).format(uri=uri, appsink=appsink)
 #################################################################################################
 # [YENİ] Barkodu okuyup sayıyı bulan fonksiyon  ------ kutuyu yerde çizmek için 2 yeni 1 de değiştirilmiş fonksiyon-------
 # [DEĞİŞTİRİLDİ] H264 bozulmalarına karşı merkez ortalaması alan yeni okuyucu eskisinde tek piksele bakıyorduk baya bi sorunluydu.
-def read_barcode(frame):
-    binary_str = ""
+def read_barcode(frame): #Görüntünün sol üst köşesindeki barkod tarzı yapımızı okuyup 0-255 arası tam sayıyı (Sıra Numarasını) bulur.
+    binary_str = "" #01 leri yan yana koyup okuyacağımız değişken
     for i in range(8):
         # 20x20'lik kutunun sadece tam merkezindeki 8x8'lik güvenli alanı alıyoruz
         # Y ekseni: 6 ile 14 arası, X ekseni: (i*20)+6 ile (i*20)+14 arası
         core_region = frame[6:14, (i*20)+6 : (i*20)+14]
         
         # Bu 64 pikselin parlaklık ortalamasını alıyoruz (np.mean hayat kurtarır)
-        mean_brightness = np.mean(core_region)
+        mean_brightness = np.mean(core_region) #seçilen 64 adet (8x8) pikselin tüm Mavi, Yeşil, Kırmızı değerlerini toplar ve ortalamasını tek bir sayı olarak verir.
         
         # Ortalama 127'den büyükse Beyaz, değilse Siyahtır
         if mean_brightness > 127:
@@ -72,18 +78,18 @@ def read_barcode(frame):
 # [YENİ] Barkodu ekrandan gizleyen (siyah bant çeken) fonksiyon
 def mask_barcode(frame):
     # Sol üst köşedeki (0,0) noktasından (160,20) noktasına kadar siyah kutu çiz
-    cv2.rectangle(frame, (0, 0), (160, 20), (0, 0, 0), -1)
+    cv2.rectangle(frame, (0, 0), (160, 20), (0, 0, 0), -1) #resim(frame), sol üst köşe(0,0), sağ alt köşe(X:160, Y:20), Renk BGR(0,0,0 Siyah), Kalınlık(-1 yani içini tamamen doldur).
     return frame
 
-# [YENİ & DEĞİŞTİRİLDİ] Artık zamana göre değil, SIRA NUMARASINA göre arıyoruz
-def get_synced_metadata_by_seq(target_seq):
-    best_payload = None
+# [YENİ ve DEĞİŞTİRİLDİ] Artık zamana göre değil, SIRA NUMARASINA göre arıyoruz
+def get_synced_metadata_by_seq(target_seq): #Okuduğumuz barkod numarasını (Örn: 82) alır, UDP kuyruğundaki 120 veriyi tarayıp 82 olanı bulur.
+    best_payload = None #boş atadık
     with meta_lock:
-        if not meta_queue:
+        if not meta_queue: #Eğer kuyruk tamamen boşsa (henüz UDP gelmediyse) hiç uğraşmadan direkt boş (None) döneriz.
             return None
         
         # Kuyruktaki tüm verileri dön, barkod numarası eşleşeni bul!
-        for ts, payload in meta_queue:
+        for ts, payload in eta_queue:
             if payload.get("seq") == target_seq:
                 best_payload = payload
                 break  # Bulduğumuz an döngüden çık
@@ -91,20 +97,19 @@ def get_synced_metadata_by_seq(target_seq):
     return best_payload
 ######################################################################################################
 
-def draw_dets(frame, dets):
+def draw_dets(frame, dets): #Gelen JSON içindeki "detections" (hedefler) listesini alıp ekrana yeşil kutuları çizen fonksiyon.
     for d in dets:
         x1 = int(d.get("x1", 0)); y1 = int(d.get("y1", 0))
         x2 = int(d.get("x2", 0)); y2 = int(d.get("y2", 0))
         cls = int(d.get("cls", 0)); conf = float(d.get("conf", 0.0))
-        
-        # Görsel İyileştirme: Daha kalın ve okunur kutular
-        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-        label = "ID:{} %{:.0f}".format(cls, conf*100)
+     
+        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2) #Hedefin etrafına (x1,y1)'den (x2,y2)'ye kadar, yeşil renkte (0,255,0), 2 piksel kalınlığında bir kutu çizer.
+        label = "ID:{} %{:.0f}".format(cls, conf*100) #Ekranın üzerine yazılacak "ID:0 %85" gibi formatlı metin. conf*100 ile ondalık skoru yüzdeye çeviriyoruz.
         
         # Etiket arka planı (okunabilirlik için)
-        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        cv2.rectangle(frame, (x1, y1-20), (x1+t_size[0], y1), (0,255,0), -1)
-        cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0] #yazacağımız yazının piksel olarak genişliğini ve yüksekliğini hesaplar ki arkasına tam o boyutta bir yeşil bant koyalım (t_size içine atar). FONT_HERSHEY_SIMPLEX tipini kullanır.
+        cv2.rectangle(frame, (x1, y1-20), (x1+t_size[0], y1), (0,255,0), -1) #Yazının altına, okunaklı olsun diye (x1, y1-20)'den başlayan, yazı genişliği kadar uzanan yeşil renkli, -1 kalınlığında (dolu) bir arkaplan çizer.
+        cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1) #yeşil dolgunun üzerine, siyah renkte (0,0,0), 1 kalınlığında yazımızı yazar.
     return frame
 
 class MetaReceiver(threading.Thread):
