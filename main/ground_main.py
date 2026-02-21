@@ -89,30 +89,6 @@ def get_synced_metadata_by_seq(target_seq):
                 
     return best_payload
 ######################################################################################################
-def get_synced_metadata(current_time):
-    """
-    Video zamanına en uygun metadatayı kuyruktan çeker.
-    """
-    target_time = current_time - VIDEO_LATENCY_SEC
-    best_payload = None
-    min_diff = 100.0 # Başlangıçta büyük bir farkde
-    
-    with meta_lock:
-        if not meta_queue:
-            return None, 0.0
-        
-        # Kuyruktaki tüm paketlere bak, zamanı en yakın olanı bul
-        for ts, payload in meta_queue:
-            diff = abs(ts - target_time)
-            if diff < min_diff:
-                min_diff = diff
-                best_payload = payload
-            
-        # Eğer en iyi eşleşme bile çok eskiyse (örn 1 saniye) çizme
-        if min_diff > 0.5:
-            return None, min_diff
-            
-    return best_payload, min_diff
 
 def draw_dets(frame, dets):
     for d in dets:
@@ -257,7 +233,7 @@ def draw_overlay(frame, tel, fps, meta_payload, sync_diff):
         det_count = len(meta_payload.get("detections", []))
         infer_ms = float(meta_payload.get("infer_ms", 0))
 
-    cv2.putText(frame, "AI: {} Obj | Infer: {:.1f}ms | SeQ Numarası: {}s".format(         #bu kısımdaki sync diff seQ numarasını olarak değiştirdim.
+    cv2.putText(frame, "AI: {} Obj | Infer: {:.1f}ms | SeQ Numarası: {}".format(   #bu kısımdaki sync diff seQ numarasını olarak değiştirdim.
         det_count, infer_ms, sync_diff), (20, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
 
 def main():
