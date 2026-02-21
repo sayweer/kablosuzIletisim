@@ -9,7 +9,6 @@ from collections import deque # Bufferlama için gerekli
 # --- AYARLAR ---
 SRT_LISTEN_PORT = 9000
 SRT_LATENCY_MS = 120         # Wi-Fi ortamında biraz artırmak titremeyi azaltır
-VIDEO_LATENCY_SEC = 0.15     # Tahmini video decode gecikmesi (Senkronizasyon ayarı)
 
 MAVLINK_CONN_STR = "udp:0.0.0.0:14550"
 MAVLINK_BAUD = 57600
@@ -47,7 +46,49 @@ def build_receiver_pipeline_nvidia():
         "videoconvert ! video/x-raw,format=BGR ! " 
         "{appsink}"
     ).format(uri=uri, appsink=appsink)
+#################################################################################################
+# [YENİ] Barkodu okuyup sayıyı bulan fonksiyon  ------ kutuyu yerde çizmek için 2 yeni 1 de değiştirilmiş fonksiyon-------
+def read_barcode(frame):
+    binary_str = ""
+    for i in range(8):
+        # 20x20 piksellik kutunun tam göbeğinin koordinatları
+        center_y = 10
+        center_x = (i * 20) + 10
+        
+        # Pikselin B, G, R değerlerini al
+        b, g, r = frame[center_y, center_x]
+        
+        # Parlaklık hesabı (Eşikleme)
+        brightness = (int(b) + int(g) + int(r)) / 3
+        if brightness > 127:
+            binary_str += "1"  # Beyaz
+        else:
+            binary_str += "0"  # Siyah
+            
+    # '01010010' gibi bir metni onluk tabanda tam sayıya (Örn: 82) çevir
+    return int(binary_str, 2)
 
+# [YENİ] Barkodu ekrandan gizleyen (siyah bant çeken) fonksiyon
+def mask_barcode(frame):
+    # Sol üst köşedeki (0,0) noktasından (160,20) noktasına kadar siyah kutu çiz
+    cv2.rectangle(frame, (0, 0), (160, 20), (0, 0, 0), -1)
+    return frame
+
+# [YENİ & DEĞİŞTİRİLDİ] Artık zamana göre değil, SIRA NUMARASINA göre arıyoruz
+def get_synced_metadata_by_seq(target_seq):
+    best_payload = None
+    with meta_lock:
+        if not meta_queue:
+            return None
+        
+        # Kuyruktaki tüm verileri dön, barkod numarası eşleşeni bul!
+        for ts, payload in meta_queue:
+            if payload.get("seq") == target_seq:
+                best_payload = payload
+                break  # Bulduğumuz an döngüden çık
+                
+    return best_payload
+######################################################################################################
 def get_synced_metadata(current_time):
     """
     Video zamanına en uygun metadatayı kuyruktan çeker.
@@ -216,7 +257,7 @@ def draw_overlay(frame, tel, fps, meta_payload, sync_diff):
         det_count = len(meta_payload.get("detections", []))
         infer_ms = float(meta_payload.get("infer_ms", 0))
 
-    cv2.putText(frame, "AI: {} Obj | Infer: {:.1f}ms | Sync Diff: {:.3f}s".format(
+    cv2.putText(frame, "AI: {} Obj | Infer: {:.1f}ms | SeQ Numarası: {}s".format(         #bu kısımdaki sync diff seQ numarasını olarak değiştirdim.
         det_count, infer_ms, sync_diff), (20, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
 
 def main():
@@ -262,6 +303,18 @@ def main():
                 cap = None # Cap'i sıfırla ki üstteki if bloğu tekrar bağlanmaya çalışsın
                 time.sleep(1.0)
                 continue
+            
+            #########################################################################################
+            # [YENİ SİHİR BURADA BAŞLIYOR]
+            # 1. Görüntünün köşesindeki barkodu oku (Örn: seq_num = 82)
+            seq_num = read_barcode(frame)
+
+            # 2. Barkodun üzerini siyah bantla kapat ki gözümüzü yormasın
+            frame = mask_barcode(frame)
+
+            # 3. Geçmiş kutusuna (Queue) gidip 82 numaralı metadatayı iste!
+            payload = get_synced_metadata_by_seq(seq_num)
+            #########################################################################################
 
             # FPS Hesabı
             n += 1
@@ -275,15 +328,12 @@ def main():
             with mav.lock:
                 tel = dict(mav.data)
 
-            # Senkronize Metadata Çekimi
-            payload, sync_diff = get_synced_metadata(now)
-
             if payload:
                 dets = payload.get("detections", [])
                 if dets:
                     frame = draw_dets(frame, dets)
 
-            draw_overlay(frame, tel, fps, payload, sync_diff)
+            draw_overlay(frame, tel, fps, payload, seq_num)     # sync_diff yerine seq_num gönderdik
             cv2.imshow(WINDOW_NAME, frame)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):

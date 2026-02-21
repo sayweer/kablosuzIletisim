@@ -34,6 +34,8 @@ INFER_EVERY_N = 3
 # =========================
 # GLOBALLER VE KİLİTLER
 # =========================
+latest_frame_seq = 0  # [YENİ] Son karenin barkod sıra numarası
+
 running = True
 
 # [DÜZELTME]: Thread Kilitlerini (Locks) Ayırdık!
@@ -99,6 +101,22 @@ def nms(boxes, scores, iou_threshold):
         inds = np.where(iou <= iou_threshold)[0]
         order = order[inds + 1]
     return keep
+
+# [YENİ] Sıra numarasını (0-255) alıp 8 bitlik siyah-beyaz barkod çizen fonksiyon
+def draw_barcode(frame, seq_num):
+    # Sayıyı 8 haneli binary (ikilik) metne çevir. Örn: 5 -> '00000101'
+    binary_str = format(seq_num, '08b')
+    
+    # 8 bitin her birini tek tek dön
+    for i, bit in enumerate(binary_str):
+        # 1 ise Bembeyaz (255,255,255), 0 ise Zifiri Siyah (0,0,0) yap
+        color = (255, 255, 255) if bit == '1' else (0, 0, 0)
+        
+        # Numpy ile 20x20 piksellik bir kareyi anında boya (İşlemciyi hiç yormaz)
+        # Y ekseni: 0'dan 20'ye. X ekseni: 0-20, 20-40, 40-60... şeklinde ilerler.
+        frame[0:20, i*20:(i+1)*20] = color
+        
+    return frame
 
 # =========================
 # YOLOv8 / YOLOv11 ORTAK TENSORRT SINIFI
@@ -180,8 +198,10 @@ class YOLO_TRT:
 # THREAD 1: KAMERA
 # =========================
 def capture_thread():
-    global latest_stream_frame, latest_infer_frame, latest_frame_ts, running
+    global latest_stream_frame, latest_infer_frame, latest_frame_ts, latest_frame_seq ,running
     
+    current_seq = 0  # [YENİ] Sayacımız 0'dan başlıyor
+
     cap = cv2.VideoCapture(USB_CAM_DEV, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
@@ -193,6 +213,9 @@ def capture_thread():
         if not ret: continue
         
         ts = time.time()
+
+        # [YENİ]: Çıplak frame'i kopyalamadan önce barkodunu vuruyoruz!
+        frame = draw_barcode(frame, current_seq)
         
         # [DÜZELTME]: Kamera, okuduğu kareyi yayıncının ve yapay zekanın kutusuna AYRI AYRI koyuyor.
         with stream_lock:
@@ -201,6 +224,10 @@ def capture_thread():
         with infer_lock:
             latest_infer_frame = frame
             latest_frame_ts = ts
+            latest_frame_seq = current_seq  # [YENİ] Sıra numarasını yapay zekaya paslıyoruz
+
+        # [YENİ]: Sayacı 1 artır, 255'i geçince 0'a döndür (Mod 256)
+        current_seq = (current_seq + 1) % 256
 
 # =========================
 # THREAD 2: SRT VİDEO YAYINI
@@ -266,6 +293,7 @@ def inference_thread():
                 if latest_infer_frame is not None:
                     frame = latest_infer_frame.copy()
                     frame_ts = latest_frame_ts
+                    frame_seq = latest_frame_seq  # [YENİ] Barkod numarasını aldık
                     
             if frame is None:
                 time.sleep(0.01)
@@ -283,6 +311,7 @@ def inference_thread():
             # [DÜZELTME]: AI o karede çalışmamış olsa bile, hafızadaki son kutuları (last_known_detections) yolluyoruz.
             payload = {
                 "ts": frame_ts,
+                "seq": frame_seq,  # <--- İşte Yerdeki PC'nin arayacağı TC Kimlik Numarası!
                 "infer_ms": last_infer_ms,
                 "detections": last_known_detections,
                 "det_count": len(last_known_detections),
