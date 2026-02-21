@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+###255'ten 0'a dönerken yaşanabilecek saliselik bir atlama ihtimali için bulanık eşleştirme algoritması hazırlayacağız sonraki prototiplerde!!!!!)
 import os, cv2, time, json, socket, threading
-import numpy as np
+import numpy as np #numpy nin mean fonksiyonunu 8x8 piksel meselesinde kullandık
 from pymavlink import mavutil
 from collections import deque # Bufferlama için gerekli
 
@@ -48,22 +49,22 @@ def build_receiver_pipeline_nvidia():
     ).format(uri=uri, appsink=appsink)
 #################################################################################################
 # [YENİ] Barkodu okuyup sayıyı bulan fonksiyon  ------ kutuyu yerde çizmek için 2 yeni 1 de değiştirilmiş fonksiyon-------
+# [DEĞİŞTİRİLDİ] H264 bozulmalarına karşı merkez ortalaması alan yeni okuyucu eskisinde tek piksele bakıyorduk baya bi sorunluydu.
 def read_barcode(frame):
     binary_str = ""
     for i in range(8):
-        # 20x20 piksellik kutunun tam göbeğinin koordinatları
-        center_y = 10
-        center_x = (i * 20) + 10
+        # 20x20'lik kutunun sadece tam merkezindeki 8x8'lik güvenli alanı alıyoruz
+        # Y ekseni: 6 ile 14 arası, X ekseni: (i*20)+6 ile (i*20)+14 arası
+        core_region = frame[6:14, (i*20)+6 : (i*20)+14]
         
-        # Pikselin B, G, R değerlerini al
-        b, g, r = frame[center_y, center_x]
+        # Bu 64 pikselin parlaklık ortalamasını alıyoruz (np.mean hayat kurtarır)
+        mean_brightness = np.mean(core_region)
         
-        # Parlaklık hesabı (Eşikleme)
-        brightness = (int(b) + int(g) + int(r)) / 3
-        if brightness > 127:
-            binary_str += "1"  # Beyaz
+        # Ortalama 127'den büyükse Beyaz, değilse Siyahtır
+        if mean_brightness > 127:
+            binary_str += "1"  
         else:
-            binary_str += "0"  # Siyah
+            binary_str += "0"  
             
     # '01010010' gibi bir metni onluk tabanda tam sayıya (Örn: 82) çevir
     return int(binary_str, 2)

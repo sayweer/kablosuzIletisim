@@ -214,19 +214,23 @@ def capture_thread():
         
         ts = time.time()
 
-        # [YENİ]: Çıplak frame'i kopyalamadan önce barkodunu vuruyoruz!
-        frame = draw_barcode(frame, current_seq)
-        
-        # [DÜZELTME]: Kamera, okuduğu kareyi yayıncının ve yapay zekanın kutusuna AYRI AYRI koyuyor.
-        with stream_lock:
-            latest_stream_frame = frame
-        
-        with infer_lock:
-            latest_infer_frame = frame
-            latest_frame_ts = ts
-            latest_frame_seq = current_seq  # [YENİ] Sıra numarasını yapay zekaya paslıyoruz
+        # [YENİ]: Barkod çizilmeden ÖNCE temiz bir kopya alıp yapay zeka için ayırıyoruz
+        clean_frame = frame.copy()
 
-        # [YENİ]: Sayacı 1 artır, 255'i geçince 0'a döndür (Mod 256)
+        # Şimdi orijinal görüntünün üzerine barkodumuzu çiziyoruz
+        barcode_frame = draw_barcode(frame, current_seq)
+        
+        # 1. Yayıncı kabinine (Stream) BARKODLU görüntüyü koyuyoruz
+        with stream_lock:
+            latest_stream_frame = barcode_frame
+        
+        # 2. Yapay zeka kabinine (Infer) TEMİZ görüntüyü koyuyoruz
+        with infer_lock:
+            latest_infer_frame = clean_frame
+            latest_frame_ts = ts
+            latest_frame_seq = current_seq  # Sıra numarasını yapay zekaya paslıyoruz
+
+        # Sayacı 1 artır, 255'i geçince 0'a döndür
         current_seq = (current_seq + 1) % 256
 
 # =========================
