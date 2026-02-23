@@ -49,7 +49,7 @@ def build_receiver_pipeline_nvidia(): #SRT üzerinden gelen videoyu ekran kartı
     
     return (# pipeline birleştirme kısmı
         "srtsrc uri=\"{uri}\" ! queue max-size-buffers=4 leaky=downstream ! "  #SRT URI'sini dinle. queue: İşlemci yorulursa veriyi silmek yerine GStreamer'ın iç tamponunda beklet.
-        "tsdemux ! h264parse ! nvh264dec ! "      #h264parse: Gelen düz byte akışını anlamlı H264 bloklarına (NAL units) ayırır. # nvh264dec: NVIDIA ekran kartının özel şifre çözücüsü. İşlemciyi (CPU) kullanmadan donanımsal olarak H264'ü çözer.
+        "decodebin ! "      #h264parse: Gelen düz byte akışını anlamlı H264 bloklarına (NAL units) ayırır. # nvh264dec: NVIDIA ekran kartının özel şifre çözücüsü. İşlemciyi (CPU) kullanmadan donanımsal olarak H264'ü çözer.
         "videoconvert ! video/x-raw,format=BGR ! " # videoconvert: Ekran kartından çıkan ham formatı, OpenCV'nin sevdiği Mavi-Yeşil-Kırmızı (BGR) formatına çevirir.
         "{appsink}" # En son appsink değişkenini ekler.
     ).format(uri=uri, appsink=appsink)

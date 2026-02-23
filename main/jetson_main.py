@@ -211,6 +211,8 @@ def capture_thread():
     while running:
         ret, frame = cap.read()
         if not ret: continue
+
+        frame = cv2.resize(frame, (FRAME_W, FRAME_H)) #test amaçlı ekleme
         
         ts = time.time()
 
@@ -244,11 +246,11 @@ def stream_thread():
         "queue max-size-buffers=2 leaky=downstream ! "
         "videoconvert ! video/x-raw, format=BGRx ! "
         "nvvidconv ! video/x-raw(memory:NVMM), format=NV12 ! "
-        "nvv4l2h264enc bitrate={} maxperf-enable=0 preset-level=1 control-rate=1 ! "
+        "nvv4l2h264enc bitrate=2000000 maxperf-enable=1 preset-level=1 control-rate=1 insert-sps-pps=true idrinterval=15 ! "
         "video/x-h264, stream-format=byte-stream ! "
         "h264parse ! mpegtsmux alignment=7 ! "
         "srtsink uri=srt://{}:{} sync=false wait-for-connection=false"
-    ).format(BITRATE, PC_IP, SRT_PORT)
+    ).format(PC_IP, SRT_PORT)
     
     out = cv2.VideoWriter(gst_out, cv2.CAP_GSTREAMER, 0, float(FPS), (FRAME_W, FRAME_H), True)
 
