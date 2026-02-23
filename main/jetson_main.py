@@ -15,8 +15,8 @@ cv2.setNumThreads(1)
 # AYARLAR
 # =========================
 PC_IP = "192.168.1.100"
-SRT_PORT = 9000  #doğrudan işlenmemiş ham görüntünün sıkıştırılıp srt ile gönderildiği port numarası... (srt otoyolu)
-META_PORT = 5005  #yapay zekanın işeleme sonucu elde ettiği verileri json ile ilettiği port numarası...   (UDP patikası)
+SRT_PORT = 9000
+META_PORT = 5005
 
 USB_CAM_DEV = "/dev/video0"
 FRAME_W = 640
@@ -28,41 +28,37 @@ IMGSZ = 640
 CONF_THRES = 0.40
 IOU_THRES = 0.45
 
-BITRATE = 1500000
+BITRATE = 2000000
 INFER_EVERY_N = 3
+
+# SRT dayanıklılık için (Wi-Fi jitter/paket kaybında şart)
+SRT_LATENCY_MS = 300
 
 # =========================
 # GLOBALLER VE KİLİTLER
 # =========================
-latest_frame_seq = 0  # [YENİ] Son karenin barkod sıra numarası
-
+latest_frame_seq = 0
 running = True
 
-# [DÜZELTME]: Thread Kilitlerini (Locks) Ayırdık!
-# Eskiden tek bir kilit vardı ve yapay zeka çalışırken video yayını beklemek zorunda kalıyordu.
-# Şimdi video yayını için ayrı, yapay zeka için ayrı kilit ve değişken kullanıyoruz.
 stream_lock = threading.Lock()
 infer_lock = threading.Lock()
 
-latest_stream_frame = None  #video yayıncısı kabini
-latest_infer_frame = None   #yapay zekanın kabini
+latest_stream_frame = None
+latest_infer_frame = None
 latest_frame_ts = 0.0
 
 # =========================
-# TENSORRT YÜKLEME (PyCUDA DÜZELTİLDİ)
+# TENSORRT YÜKLEME
 # =========================
 HAS_TRT = False
 try:
     import tensorrt as trt
     import pycuda.driver as cuda
-    # [DÜZELTME]: 'import pycuda.autoinit' BURADAN SİLİNDİ! 
-    # Çünkü bu komut CUDA'yı yanlış yerde (ana thread'de) başlatıp çökmeye neden oluyordu.
     HAS_TRT = True
     print("[SYS] TensorRT modulleri hazir.")
 except ImportError as e:
     print("[ERR] TensorRT hatasi:", e)
 
-# (letterbox_bgr, clip_box ve nms fonksiyonları aynı, kalabalık yapmasın diye atlıyorum ama kodunda kalacak)
 def letterbox_bgr(img, new_shape=640, color=(114, 114, 114)):
     h, w = img.shape[:2]
     r = min(float(new_shape) / float(h), float(new_shape) / float(w))
@@ -75,52 +71,49 @@ def letterbox_bgr(img, new_shape=640, color=(114, 114, 114)):
     return cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color), r, dw, dh
 
 def clip_box(x1, y1, x2, y2, w, h):
-    return max(0.0, min(float(w - 1), x1)), max(0.0, min(float(h - 1), y1)), max(0.0, min(float(w - 1), x2)), max(0.0, min(float(h - 1), y2))
+    return (max(0.0, min(float(w - 1), x1)),
+            max(0.0, min(float(h - 1), y1)),
+            max(0.0, min(float(w - 1), x2)),
+            max(0.0, min(float(h - 1), y2)))
 
 def nms(boxes, scores, iou_threshold):
-    if len(boxes) == 0: return []
+    if len(boxes) == 0:
+        return []
     boxes = np.array(boxes, dtype=np.float32)
     scores = np.array(scores, dtype=np.float32)
+
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
     order = scores.argsort()[::-1]
+
     keep = []
     while order.size > 0:
         i = order[0]
         keep.append(i)
+
         xx1 = np.maximum(x1[i], x1[order[1:]])
         yy1 = np.maximum(y1[i], y1[order[1:]])
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
+
         w = np.maximum(0.0, xx2 - xx1)
         h = np.maximum(0.0, yy2 - yy1)
         inter = w * h
-        # [DÜZELTME]: Claude'un uyardığı "Sıfıra Bölünme (Division by Zero)" hatası giderildi.
+
         union = areas[i] + areas[order[1:]] - inter + 1e-6
-        iou = np.where(union > 0, inter / union, 0.0) 
+        iou = np.where(union > 0, inter / union, 0.0)
+
         inds = np.where(iou <= iou_threshold)[0]
         order = order[inds + 1]
     return keep
 
-# [YENİ] Sıra numarasını (0-255) alıp 8 bitlik siyah-beyaz barkod çizen fonksiyon
 def draw_barcode(frame, seq_num):
-    # Sayıyı 8 haneli binary (ikilik) metne çevir. Örn: 5 -> '00000101'
     binary_str = format(seq_num, '08b')
-    
-    # 8 bitin her birini tek tek dön
     for i, bit in enumerate(binary_str):
-        # 1 ise Bembeyaz (255,255,255), 0 ise Zifiri Siyah (0,0,0) yap
         color = (255, 255, 255) if bit == '1' else (0, 0, 0)
-        
-        # Numpy ile 20x20 piksellik bir kareyi anında boya (İşlemciyi hiç yormaz)
-        # Y ekseni: 0'dan 20'ye. X ekseni: 0-20, 20-40, 40-60... şeklinde ilerler.
         frame[0:20, i*20:(i+1)*20] = color
-        
     return frame
 
-# =========================
-# YOLOv8 / YOLOv11 ORTAK TENSORRT SINIFI
-# =========================
 class YOLO_TRT:
     def __init__(self, engine_path):
         self.logger = trt.Logger(trt.Logger.WARNING)
@@ -128,80 +121,85 @@ class YOLO_TRT:
         with open(engine_path, "rb") as f:
             self.engine = self.runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
-        
+
         self.inputs = []
         self.outputs = []
         self.bindings = []
         self.stream = cuda.Stream()
-        
-        # [DÜZELTME]: Claude'un belirttiği Jetson Nano'ya (TRT 8.2) özel Dinamik Shape Hatası Çözümü.
+
         for binding in self.engine:
             shape = self.engine.get_binding_shape(binding)
-            # Eğer modelde -1 (dinamik) boyut varsa, bunu çökmeye sebep olmaması için 1'e çeviriyoruz.
             safe_shape = tuple(s if s > 0 else 1 for s in shape)
-            size = trt.volume(safe_shape) 
+            size = trt.volume(safe_shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            
+
             host_mem = cuda.pagelocked_empty(size, dtype)
             dev_mem = cuda.mem_alloc(host_mem.nbytes)
             self.bindings.append(int(dev_mem))
-            
+
             if self.engine.binding_is_input(binding):
                 self.inputs.append({'host': host_mem, 'dev': dev_mem})
             else:
                 self.outputs.append({'host': host_mem, 'dev': dev_mem})
-                
+
     def infer(self, img):
         orig_h, orig_w = img.shape[:2]
         padded_img, ratio, dw, dh = letterbox_bgr(img, IMGSZ)
-        
+
         input_image = cv2.cvtColor(padded_img, cv2.COLOR_BGR2RGB)
         input_image = input_image.astype(np.float32) / 255.0
         input_image = input_image.transpose((2, 0, 1))
         input_image = np.expand_dims(input_image, axis=0)
-        
+
         np.copyto(self.inputs[0]['host'], input_image.ravel())
         cuda.memcpy_htod_async(self.inputs[0]['dev'], self.inputs[0]['host'], self.stream)
+
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        
+
         for out in self.outputs:
             cuda.memcpy_dtoh_async(out['host'], out['dev'], self.stream)
         self.stream.synchronize()
-        
+
         output = self.outputs[0]['host']
-        num_channels = len(output) // 8400 
+        num_channels = len(output) // 8400
         output = output.reshape((num_channels, 8400)).T
-        
+
         boxes, scores, class_ids = [], [], []
-        
         for row in output:
             class_scores = row[4:]
-            class_id = np.argmax(class_scores)
-            confidence = class_scores[class_id]
+            class_id = int(np.argmax(class_scores))
+            confidence = float(class_scores[class_id])
             if confidence > CONF_THRES:
-                cx, cy, w, h = row[0], row[1], row[2], row[3]
+                cx, cy, w, h = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+
                 x1 = (cx - w / 2.0 - dw) / ratio
                 y1 = (cy - h / 2.0 - dh) / ratio
                 x2 = (cx + w / 2.0 - dw) / ratio
                 y2 = (cy + h / 2.0 - dh) / ratio
+
                 x1, y1, x2, y2 = clip_box(x1, y1, x2, y2, orig_w, orig_h)
-                
+
                 boxes.append([x1, y1, x2, y2])
-                scores.append(float(confidence))
-                class_ids.append(int(class_id))
-                
+                scores.append(confidence)
+                class_ids.append(class_id)
+
         indices = nms(boxes, scores, IOU_THRES)
-        detections = [{"x1": boxes[i][0], "y1": boxes[i][1], "x2": boxes[i][2], "y2": boxes[i][3], "conf": scores[i], "cls": class_ids[i]} for i in indices]
+        detections = []
+        for i in indices:
+            detections.append({
+                "x1": float(boxes[i][0]), "y1": float(boxes[i][1]),
+                "x2": float(boxes[i][2]), "y2": float(boxes[i][3]),
+                "conf": float(scores[i]), "cls": int(class_ids[i])
+            })
         return detections
 
 # =========================
 # THREAD 1: KAMERA
 # =========================
 def capture_thread():
-    global latest_stream_frame, latest_infer_frame, latest_frame_ts, latest_frame_seq ,running
-    
-    current_seq = 0  # [YENİ] Sayacımız 0'dan başlıyor
+    global latest_stream_frame, latest_infer_frame, latest_frame_ts, latest_frame_seq, running
 
+    current_seq = 0
     cap = cv2.VideoCapture(USB_CAM_DEV, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
@@ -210,29 +208,24 @@ def capture_thread():
 
     while running:
         ret, frame = cap.read()
-        if not ret: continue
+        if not ret or frame is None:
+            time.sleep(0.01)
+            continue
 
-        frame = cv2.resize(frame, (FRAME_W, FRAME_H)) #test amaçlı ekleme
-        
+        frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         ts = time.time()
 
-        # [YENİ]: Barkod çizilmeden ÖNCE temiz bir kopya alıp yapay zeka için ayırıyoruz
         clean_frame = frame.copy()
-
-        # Şimdi orijinal görüntünün üzerine barkodumuzu çiziyoruz
         barcode_frame = draw_barcode(frame, current_seq)
-        
-        # 1. Yayıncı kabinine (Stream) BARKODLU görüntüyü koyuyoruz
+
         with stream_lock:
             latest_stream_frame = barcode_frame
-        
-        # 2. Yapay zeka kabinine (Infer) TEMİZ görüntüyü koyuyoruz
+
         with infer_lock:
             latest_infer_frame = clean_frame
             latest_frame_ts = ts
-            latest_frame_seq = current_seq  # Sıra numarasını yapay zekaya paslıyoruz
+            latest_frame_seq = current_seq
 
-        # Sayacı 1 artır, 255'i geçince 0'a döndür
         current_seq = (current_seq + 1) % 256
 
 # =========================
@@ -240,28 +233,42 @@ def capture_thread():
 # =========================
 def stream_thread():
     global latest_stream_frame, running
-    
+
+    # HATA KAYNAĞI OLAN ŞEY: zayıf timestamping + düşük SRT toleransı + parse config yok
+    # ÇÖZÜM: appsrc is-live/do-timestamp/block + h264parse config-interval=1 + SRT latency
     gst_out = (
-        "appsrc ! video/x-raw, format=BGR ! "
+        "appsrc is-live=true do-timestamp=true block=true format=time ! "
+        "video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 ! "
         "queue max-size-buffers=2 leaky=downstream ! "
-        "videoconvert ! video/x-raw, format=BGRx ! "
-        "nvvidconv ! video/x-raw(memory:NVMM), format=NV12 ! "
-        "nvv4l2h264enc bitrate=2000000 maxperf-enable=1 preset-level=1 control-rate=1 insert-sps-pps=true idrinterval=15 ! "
-        "video/x-h264, stream-format=byte-stream ! "
-        "h264parse ! mpegtsmux alignment=7 ! "
-        "srtsink uri=srt://{}:{} sync=false wait-for-connection=false"
-    ).format(PC_IP, SRT_PORT)
-    
+        "videoconvert ! video/x-raw,format=BGRx ! "
+        "nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width={w},height={h},framerate={fps}/1 ! "
+        "nvv4l2h264enc bitrate={br} maxperf-enable=1 preset-level=1 control-rate=1 "
+        "insert-sps-pps=true idrinterval=15 ! "
+        "h264parse config-interval=1 ! "
+        "mpegtsmux alignment=7 ! "
+        "queue max-size-buffers=4 leaky=downstream ! "
+        "srtsink uri=srt://{ip}:{port}?mode=caller&latency={lat}&transtype=live "
+        "sync=false wait-for-connection=true"
+    ).format(w=FRAME_W, h=FRAME_H, fps=FPS, br=BITRATE, ip=PC_IP, port=SRT_PORT, lat=SRT_LATENCY_MS)
+
     out = cv2.VideoWriter(gst_out, cv2.CAP_GSTREAMER, 0, float(FPS), (FRAME_W, FRAME_H), True)
+    if not out.isOpened():
+        print("[ERR] GStreamer VideoWriter acilamadi! Pipeline:\n{}".format(gst_out))
+        # Stream thread'i öldürme, ama boşta kal
+        while running:
+            time.sleep(1.0)
+        return
 
     while running:
         frame_to_send = None
         with stream_lock:
             if latest_stream_frame is not None:
                 frame_to_send = latest_stream_frame.copy()
-        
-        if frame_to_send is not None: out.write(frame_to_send)
-        else: time.sleep(0.01)
+
+        if frame_to_send is not None:
+            out.write(frame_to_send)
+        else:
+            time.sleep(0.01)
 
 # =========================
 # THREAD 3: AI VE METADATA
@@ -269,23 +276,17 @@ def stream_thread():
 def inference_thread():
     global latest_infer_frame, latest_frame_ts, latest_frame_seq, running
 
-    # UDP soketi (her koşulda lazım)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
 
-    # Basit rate-limit (çok agresif spamlemesin)
-    SEND_MIN_INTERVAL_SEC = 0.01  # ~100 Hz üst sınır, pratikte daha düşük olur
+    SEND_MIN_INTERVAL_SEC = 0.01
     last_send_t = 0.0
 
-    # Flicker engellemek için cache
     last_known_detections = []
     last_infer_ms = 0.0
 
-    # Aynı kareyi tekrar tekrar infer etmemek için
     last_infer_seq = None
-    frame_count = 0
 
-    # TRT yoksa: asla çökme, sadece boş metadata gönder.
     if not HAS_TRT:
         print("[AI] TensorRT/PyCUDA yok. Bos metadata ile devam (trt_ok=False).")
         while running:
@@ -306,14 +307,13 @@ def inference_thread():
             if now - last_send_t >= SEND_MIN_INTERVAL_SEC:
                 try:
                     sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
-                except:
+                except Exception:
                     pass
                 last_send_t = now
 
             time.sleep(0.02)
         return
 
-    # TRT var: CUDA context'i bu thread içinde kur
     ctx = None
     yolo = None
     trt_ok = False
@@ -323,7 +323,6 @@ def inference_thread():
             cuda.init()
             ctx = cuda.Device(0).make_context()
         except Exception as e:
-            # CUDA context kurulamazsa bile thread ölmesin, boş metadata yollasın
             print("[ERR] CUDA context kurulamadi:", e)
             while running:
                 with infer_lock:
@@ -338,19 +337,16 @@ def inference_thread():
                     "det_count": 0,
                     "trt_ok": False
                 }
-
                 now = time.time()
                 if now - last_send_t >= SEND_MIN_INTERVAL_SEC:
                     try:
                         sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
-                    except:
+                    except Exception:
                         pass
                     last_send_t = now
-
                 time.sleep(0.02)
             return
 
-        # Engine yükle
         try:
             yolo = YOLO_TRT(ENGINE_PATH)
             trt_ok = True
@@ -365,7 +361,6 @@ def inference_thread():
             frame_ts = 0.0
             frame_seq = 0
 
-            # En güncel inference karesini al
             with infer_lock:
                 if latest_infer_frame is not None:
                     frame = latest_infer_frame
@@ -376,20 +371,11 @@ def inference_thread():
                 time.sleep(0.01)
                 continue
 
-            # Aynı seq'i infer etmeye çalışma (CPU/GPU boş yere yorulmasın)
-            # Ama metadata'yı yine de göndereceğiz (cache ile)
             do_infer = False
-            if yolo is not None:
-                # Yeni bir kamera karesi gelmiş mi? (Öncekiyle aynı değilse yenidir)
-                if last_infer_seq != frame_seq:
-                    
-                    # İşlesek de işlemesek de bu kareyi artık gördük diye işaretliyoruz.
-                    last_infer_seq = frame_seq 
-                    
-                    # Gelen bu yeni kameranın SIRA NUMARASI 3'e tam bölünüyorsa AI çalışsın!
-                    # (Yani 0, 3, 6, 9... numaralı karelerde çalışır, kameraya %100 senkronize olur)
-                    if (frame_seq % INFER_EVERY_N) == 0:
-                        do_infer = True
+            if yolo is not None and (last_infer_seq != frame_seq):
+                last_infer_seq = frame_seq
+                if (frame_seq % INFER_EVERY_N) == 0:
+                    do_infer = True
 
             if do_infer:
                 t0 = time.time()
@@ -399,7 +385,6 @@ def inference_thread():
                 except Exception:
                     pass
 
-            # Metadata payload (her durumda gönder)
             payload = {
                 "ts": frame_ts,
                 "seq": frame_seq,
@@ -413,19 +398,16 @@ def inference_thread():
             if now - last_send_t >= SEND_MIN_INTERVAL_SEC:
                 try:
                     sock.sendto(json.dumps(payload).encode("utf-8"), (PC_IP, META_PORT))
-                except:
+                except Exception:
                     pass
                 last_send_t = now
 
-            # Ufak nefes
             time.sleep(0.005)
 
     finally:
-        # CUDA context temizliği (Jetson'da önemli)
         try:
             if ctx is not None:
                 ctx.pop()
-                # ctx.detach() bazı sistemlerde daha temiz kapatır
                 try:
                     ctx.detach()
                 except Exception:
@@ -437,10 +419,18 @@ def inference_thread():
 # MAIN
 # =========================
 if __name__ == "__main__":
-    threads = [threading.Thread(target=capture_thread), threading.Thread(target=stream_thread), threading.Thread(target=inference_thread)]
-    for t in threads: t.start()
+    threads = [
+        threading.Thread(target=capture_thread),
+        threading.Thread(target=stream_thread),
+        threading.Thread(target=inference_thread),
+    ]
+    for t in threads:
+        t.start()
+
     try:
-        while True: time.sleep(1)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         running = False
-        for t in threads: t.join()
+        for t in threads:
+            t.join()
