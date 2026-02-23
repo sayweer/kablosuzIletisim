@@ -378,10 +378,15 @@ def inference_thread():
             # Ama metadata'yı yine de göndereceğiz (cache ile)
             do_infer = False
             if yolo is not None:
-                # INFER_EVERY_N ile birlikte çalışsın
-                if (frame_count % INFER_EVERY_N) == 0:
-                    # Aynı seq geldiyse tekrar infer etme
-                    if last_infer_seq != frame_seq:
+                # Yeni bir kamera karesi gelmiş mi? (Öncekiyle aynı değilse yenidir)
+                if last_infer_seq != frame_seq:
+                    
+                    # İşlesek de işlemesek de bu kareyi artık gördük diye işaretliyoruz.
+                    last_infer_seq = frame_seq 
+                    
+                    # Gelen bu yeni kameranın SIRA NUMARASI 3'e tam bölünüyorsa AI çalışsın!
+                    # (Yani 0, 3, 6, 9... numaralı karelerde çalışır, kameraya %100 senkronize olur)
+                    if (frame_seq % INFER_EVERY_N) == 0:
                         do_infer = True
 
             if do_infer:
@@ -389,12 +394,8 @@ def inference_thread():
                 try:
                     last_known_detections = yolo.infer(frame)
                     last_infer_ms = (time.time() - t0) * 1000.0
-                    last_infer_seq = frame_seq
                 except Exception:
-                    # Hata olursa son iyi dets kalsın, infer_ms güncellenmesin
                     pass
-
-            frame_count += 1
 
             # Metadata payload (her durumda gönder)
             payload = {

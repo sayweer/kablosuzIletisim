@@ -82,19 +82,14 @@ def mask_barcode(frame):
     return frame
 
 # [YENİ ve DEĞİŞTİRİLDİ] Artık zamana göre değil, SIRA NUMARASINA göre arıyoruz
-def get_synced_metadata_by_seq(target_seq): #Okuduğumuz barkod numarasını (Örn: 82) alır, UDP kuyruğundaki 120 veriyi tarayıp 82 olanı bulur.
-    best_payload = None #boş atadık
+def get_synced_metadata_by_seq(target_seq):
     with meta_lock:
-        if not meta_queue: #Eğer kuyruk tamamen boşsa (henüz UDP gelmediyse) hiç uğraşmadan direkt boş (None) döneriz.
+        if not meta_queue:
             return None
-        
-        # Kuyruktaki tüm verileri dön, barkod numarası eşleşeni bul!
-        for ts, payload in meta_queue:
+        for ts, payload in reversed(meta_queue):  # EN YENİDEN GERİYE
             if payload.get("seq") == target_seq:
-                best_payload = payload
-                break  # Bulduğumuz an döngüden çık
-                
-    return best_payload
+                return payload
+    return None
 ######################################################################################################
 
 def draw_dets(frame, dets): #Gelen JSON içindeki "detections" (hedefler) listesini alıp ekrana yeşil kutuları çizen fonksiyon.
