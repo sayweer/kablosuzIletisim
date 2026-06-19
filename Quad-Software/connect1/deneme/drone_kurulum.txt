@@ -1,0 +1,7 @@
+#pyt3.6 için kurulum
+
+python3 -m pip install --upgrade "pip<22" "setuptools<60" wheel
+python3 -m pip install "numpy==1.19.5" "opencv-python==4.5.5.64"
+python3 -m pip install "torch==1.10.0" "torchvision==0.11.1"   # Jetson build'e göre değişebilir
+python3 -m pip install "onnx==1.12.0"
+python3 -m pip install "pymavlink==2.4.37"

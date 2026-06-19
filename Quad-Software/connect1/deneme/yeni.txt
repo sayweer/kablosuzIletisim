@@ -1,0 +1,2 @@
+gst-launch-1.0 -v srtsrc uri="srt://0.0.0.0:9000?mode=listener&latency=120" ! \
+tsdemux ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
